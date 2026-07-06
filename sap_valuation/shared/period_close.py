@@ -37,7 +37,10 @@ def _previous_period_key(period):
 
 
 def assert_continuity(period):
-	"""Every IPB opening must equal the previous period's closing (per key)."""
+	"""Effective opening (opening + carryover) must equal the previous
+	period's closing per key. Opening is fixed at period creation; backdated
+	postings move the prior closing and this period's carryover by the same
+	delta, so the invariant holds across backdating."""
 	prev_year, prev_month = _previous_period_key(period)
 	failures = []
 	for row in _ipb_rows(period):
@@ -55,7 +58,9 @@ def assert_continuity(period):
 		)
 		if prev is None:
 			continue  # first period for this key
-		if flt(row.opening_qty, 6) != flt(prev.closing_qty, 6) or flt(row.opening_value, 2) != flt(
+		effective_qty = flt(row.opening_qty) + flt(row.carryover_qty)
+		effective_value = flt(row.opening_value) + flt(row.carryover_value)
+		if flt(effective_qty, 6) != flt(prev.closing_qty, 6) or flt(effective_value, 2) != flt(
 			prev.closing_value, 2
 		):
 			failures.append(row.item_code)

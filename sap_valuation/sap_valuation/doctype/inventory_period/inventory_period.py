@@ -20,6 +20,7 @@ POSTING_ALLOWED_STATES = ("OPEN", "PREV_OPEN_UNSETTLED")
 
 class InventoryPeriod(Document):
 	def autoname(self):
+		self.sync_period_fields()
 		abbr = frappe.db.get_value("Company", self.company, "abbr") or self.company
 		self.name = f"{abbr}-{self.period_name}"
 

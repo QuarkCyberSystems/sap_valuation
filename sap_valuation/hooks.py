@@ -18,6 +18,10 @@ sap_valuation_kernels = {
 # erpnext.stock.utils.get_incoming_rate instead of SLE-based resolution).
 sap_valuation_incoming_rate = "sap_valuation.shared.routing.get_incoming_rate"
 
+# Landed Cost Voucher handler: stock-ratio split events instead of in-place
+# SLE revaluation (consulted by the fork's update_landed_cost).
+sap_valuation_landed_cost = "sap_valuation.sap_moving_average.landed_cost.handle_landed_cost"
+
 after_migrate = ["sap_valuation.setup.custom_fields.after_migrate"]
 after_install = ["sap_valuation.setup.custom_fields.apply_custom_fields"]
 

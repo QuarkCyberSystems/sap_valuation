@@ -165,8 +165,8 @@ def recompute_closing(ipb):
 # ------------------------------------------------------------------- writers
 def write_events(scope, ipb, *, source, posting_date, movement_type, reason, qty_delta,
 		value_delta, map_before, prd_amount=0, inventory_portion=0, expense_portion=0,
-		fx_variance=0, reference_event=None, reversal_of=None, caused_by=None,
-		affects_map=0, stock_uom=None):
+		fx_variance=0, reference_event=None, reversal_of=None, movement_reversal_of=None,
+		caused_by=None, affects_map=0, stock_uom=None):
 	"""Insert the SME (when qty moves) + IVE pair; returns (sme_name, ive_name)."""
 	d = getdate(posting_date)
 	frappe.flags[KERNEL_FLAG] = True
@@ -189,7 +189,7 @@ def write_events(scope, ipb, *, source, posting_date, movement_type, reason, qty
 					"movement_type": movement_type,
 					"qty_delta": qty_delta,
 					"stock_uom": stock_uom,
-					"reversal_of": reversal_of if movement_type == "cancellation" else None,
+					"reversal_of": movement_reversal_of if movement_type == "cancellation" else None,
 				}
 			).insert(ignore_permissions=True)
 			sme_name = sme.name
@@ -539,7 +539,9 @@ def _post_cancellation(controller, scope, period, ipb, sle, source, inventory_ac
 
 	posting_date = sle.get("posting_date")
 	map_before = flt(ipb.moving_avg_price)
-	qty = flt(sle.get("actual_qty"))  # already sign-flipped by the cancellation doc
+	# the cancellation document carries the original's positive quantities;
+	# the kernel posts the mirror
+	qty = -flt(sle.get("actual_qty"))
 
 	orig = originals[0]
 	if frappe.db.exists("Inventory Valuation Event", {"reversal_of": orig.name, "is_cancelled": 0}):
@@ -557,14 +559,17 @@ def _post_cancellation(controller, scope, period, ipb, sle, source, inventory_ac
 	recompute_closing(ipb)
 	_freeze_check(ipb)
 
+	orig_sme = frappe.db.get_value("Inventory Valuation Event", orig.name, "movement_event_id")
 	sme, ive = write_events(
 		scope, ipb, source=source, posting_date=posting_date,
 		movement_type="cancellation", reason="cancellation", qty_delta=qty,
 		value_delta=value, map_before=map_before, reversal_of=orig.name,
-		stock_uom=sle.get("stock_uom"),
+		movement_reversal_of=orig_sme, stock_uom=sle.get("stock_uom"),
 	)
 	scope.save(ipb, caused_by=ive, movement_event=sme, source=source)
-	write_sle(controller, sle, scope, ipb, value)
+	mirrored_sle = dict(sle)
+	mirrored_sle["actual_qty"] = qty
+	write_sle(controller, mirrored_sle, scope, ipb, value)
 	# mirror the original event's GL with swapped sides on the cancellation date
 	legs = []
 	for g in frappe.get_all(
