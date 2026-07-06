@@ -3,26 +3,774 @@
 
 """SAP Moving Average posting kernel.
 
-Phase-1 stub: proves the routing dispatch end-to-end. The Phase-2 kernel
-replaces the body with the full posting flow:
-Normalize -> Validate (period open) -> Lock (IPB prev->current) -> Compute ->
-Write (SME + IVE + IPB + SLE-compatible rows + GL) -> Queue (projections).
+Flow per posting (single DB transaction with the voucher):
+Normalize -> Validate (period open) -> Lock (IPB prev->current) -> Compute
+(same math as sap_valuation.sap_moving_average.reference.kernel) -> Write
+(SME + IVE + IPB + SLE-compatible row + GL).
+
+The reference simulator is the behavioral spec; every branch here mirrors a
+reference-kernel branch and is covered by the same workbook-v9 anchors.
 """
 
 import frappe
 from frappe import _
+from frappe.utils import flt, getdate, now_datetime
+
+from sap_valuation.shared.accounts import get_inventory_account, get_offset_account
+from sap_valuation.shared.immutable import KERNEL_FLAG
+from sap_valuation.shared.periods import assert_posting_allowed, get_open_period
+from sap_valuation.shared.settings import get_sap_ma_setting, get_return_valuation
+
+R = 6  # internal precision
 
 
-def post_via_sap_ma_kernel(controller, sl_entries):
-	"""Entry point called by the fork's routing dispatch.
+def r6(x):
+	return flt(x, R)
 
-	:param controller: the submitting stock voucher's controller instance
-	:param sl_entries: the SLE dicts core prepared for this voucher's routed items
-	"""
-	frappe.throw(
-		_(
-			"SAP Moving Average posting kernel is not yet enabled (Phase 2). "
-			"Routing dispatch reached the kernel for {0} {1} with {2} entries."
-		).format(controller.doctype, controller.name, len(sl_entries)),
-		title=_("Kernel Not Enabled"),
+
+def r2(x):
+	return flt(x, 2)
+
+
+# --------------------------------------------------------------------- state
+class ScopeState:
+	"""Loads, locks and mutates the Inventory Period Balance rows for one
+	valuation scope (company, item [, warehouse])."""
+
+	def __init__(self, company, item_code, warehouse):
+		self.company = company
+		self.item_code = item_code
+		self.include_warehouse = frappe.get_cached_value(
+			"Item", item_code, "valuation_includes_warehouse"
+		)
+		self.warehouse = warehouse if self.include_warehouse else ""
+		self.physical_warehouse = warehouse
+
+	def _filters(self, year, month):
+		return {
+			"company": self.company,
+			"item_code": self.item_code,
+			"warehouse": self.warehouse or "",
+			"period_year": year,
+			"period_month": month,
+		}
+
+	def load(self, period, lock=True):
+		"""Fetch-or-create the IPB row for an Inventory Period; row-lock it."""
+		filters = self._filters(period.period_year, period.period_month)
+		name = frappe.db.get_value("Inventory Period Balance", filters, for_update=lock)
+		if not name:
+			prev = self._previous_closing(period)
+			frappe.flags[KERNEL_FLAG] = True
+			try:
+				doc = frappe.get_doc(
+					{
+						"doctype": "Inventory Period Balance",
+						**filters,
+						"opening_qty": prev["qty"],
+						"opening_value": prev["value"],
+						"closing_qty": prev["qty"],
+						"closing_value": prev["value"],
+						"moving_avg_price": prev["map"],
+						"total_received_since_zero": prev["counter"],
+						"is_negative": prev["is_negative"],
+						"frozen_map": prev["frozen_map"],
+					}
+				).insert(ignore_permissions=True)
+			finally:
+				frappe.flags[KERNEL_FLAG] = False
+			name = doc.name
+			frappe.db.get_value("Inventory Period Balance", name, for_update=lock)
+		return frappe.get_doc("Inventory Period Balance", name)
+
+	def _previous_closing(self, period):
+		row = frappe.get_all(
+			"Inventory Period Balance",
+			filters={
+				"company": self.company,
+				"item_code": self.item_code,
+				"warehouse": self.warehouse or "",
+			},
+			fields=[
+				"period_year", "period_month", "closing_qty", "closing_value",
+				"moving_avg_price", "total_received_since_zero", "is_negative", "frozen_map",
+			],
+			order_by="period_year desc, period_month desc",
+			limit=1,
+		)
+		row = [
+			x for x in row
+			if (x.period_year, x.period_month) < (period.period_year, period.period_month)
+		]
+		if not row:
+			return {"qty": 0, "value": 0, "map": 0, "counter": 0, "is_negative": 0, "frozen_map": 0}
+		x = row[0]
+		return {
+			"qty": x.closing_qty, "value": x.closing_value, "map": x.moving_avg_price,
+			"counter": x.total_received_since_zero, "is_negative": x.is_negative,
+			"frozen_map": x.frozen_map,
+		}
+
+	def save(self, ipb, caused_by=None, movement_event=None, source=None):
+		before = None
+		if get_sap_ma_setting(self.company, "enable_period_balance_audit_log"):
+			before = frappe.get_doc("Inventory Period Balance", ipb.name).as_dict()
+		frappe.flags[KERNEL_FLAG] = True
+		try:
+			ipb._sap_allowed_update = True
+			ipb.save(ignore_permissions=True)
+			if before is not None:
+				self._snapshot(before, ipb.as_dict(), caused_by, movement_event, source)
+		finally:
+			frappe.flags[KERNEL_FLAG] = False
+
+	def _snapshot(self, before, after, caused_by, movement_event, source):
+		group = frappe.generate_hash(length=12)
+		bucket_fields = [
+			"company", "item_code", "warehouse", "period_year", "period_month",
+			"opening_qty", "opening_value", "carryover_qty", "carryover_value",
+			"receipt_qty", "receipt_value", "issue_qty", "issue_value",
+			"adjust_qty", "adjust_value", "reval_value", "prd_value",
+			"closing_qty", "closing_value", "moving_avg_price",
+			"total_received_since_zero", "is_negative", "frozen_map",
+		]
+		for image, data in (("Before", before), ("After", after)):
+			frappe.get_doc(
+				{
+					"doctype": "Inventory Period Balance Snapshot",
+					"snapshot_event_group": group,
+					"image": image,
+					"caused_by_event_id": caused_by,
+					"movement_event_id": movement_event,
+					"source_doctype": source and source[0],
+					"source_docname": source and source[1],
+					**{f: data.get(f) for f in bucket_fields},
+				}
+			).insert(ignore_permissions=True)
+
+
+def recompute_closing(ipb):
+	ipb.closing_qty = r6(
+		flt(ipb.opening_qty) + flt(ipb.carryover_qty) + flt(ipb.receipt_qty)
+		- flt(ipb.issue_qty) + flt(ipb.adjust_qty)
 	)
+	ipb.closing_value = r6(
+		flt(ipb.opening_value) + flt(ipb.carryover_value) + flt(ipb.receipt_value)
+		- flt(ipb.issue_value) + flt(ipb.adjust_value) + flt(ipb.reval_value) + flt(ipb.prd_value)
+	)
+	if flt(ipb.closing_qty) > 0:
+		ipb.moving_avg_price = r6(flt(ipb.closing_value) / flt(ipb.closing_qty))
+
+
+# ------------------------------------------------------------------- writers
+def write_events(scope, ipb, *, source, posting_date, movement_type, reason, qty_delta,
+		value_delta, map_before, prd_amount=0, inventory_portion=0, expense_portion=0,
+		fx_variance=0, reference_event=None, reversal_of=None, caused_by=None,
+		affects_map=0, stock_uom=None):
+	"""Insert the SME (when qty moves) + IVE pair; returns (sme_name, ive_name)."""
+	d = getdate(posting_date)
+	frappe.flags[KERNEL_FLAG] = True
+	try:
+		sme_name = None
+		if movement_type:
+			sme = frappe.get_doc(
+				{
+					"doctype": "Stock Movement Event",
+					"company": scope.company,
+					"item_code": scope.item_code,
+					"warehouse": scope.physical_warehouse,
+					"period_year": d.year,
+					"period_month": d.month,
+					"posting_date": posting_date,
+					"entry_date": now_datetime(),
+					"source_doctype": source[0],
+					"source_docname": source[1],
+					"source_detail_name": source[2] if len(source) > 2 else None,
+					"movement_type": movement_type,
+					"qty_delta": qty_delta,
+					"stock_uom": stock_uom,
+					"reversal_of": reversal_of if movement_type == "cancellation" else None,
+				}
+			).insert(ignore_permissions=True)
+			sme_name = sme.name
+
+		ive = frappe.get_doc(
+			{
+				"doctype": "Inventory Valuation Event",
+				"company": scope.company,
+				"item_code": scope.item_code,
+				"warehouse": scope.physical_warehouse,
+				"period_year": d.year,
+				"period_month": d.month,
+				"posting_date": posting_date,
+				"entry_date": now_datetime(),
+				"source_doctype": source[0],
+				"source_docname": source[1],
+				"source_detail_name": source[2] if len(source) > 2 else None,
+				"reason_code": reason,
+				"qty_basis": abs(qty_delta) if qty_delta else 0,
+				"value_delta": r2(value_delta),
+				"inventory_portion": r2(inventory_portion),
+				"expense_portion": r2(expense_portion),
+				"prd_amount": r2(prd_amount),
+				"fx_variance": r2(fx_variance),
+				"affects_map": affects_map,
+				"map_before": map_before,
+				"map_after": ipb.moving_avg_price,
+				"map_frozen": ipb.is_negative,
+				"movement_event_id": sme_name,
+				"reference_receipt_event": reference_event,
+				"reversal_of": reversal_of if reason == "cancellation" else None,
+				"caused_by_event_id": caused_by,
+			}
+		).insert(ignore_permissions=True)
+	finally:
+		frappe.flags[KERNEL_FLAG] = False
+	return sme_name, ive.name
+
+
+def write_sle(controller, sle_dict, scope, ipb, value_delta):
+	"""SLE-compatible row so Bin, reports and reconciliations keep working."""
+	args = dict(sle_dict)
+	args.update(
+		{
+			"doctype": "Stock Ledger Entry",
+			"posted_via_sap_kernel": 1,
+			"actual_qty": sle_dict.get("actual_qty"),
+			"incoming_rate": sle_dict.get("incoming_rate") or 0,
+			"valuation_rate": flt(ipb.moving_avg_price),
+			"qty_after_transaction": flt(ipb.closing_qty),
+			"stock_value": flt(ipb.closing_value),
+			"stock_value_difference": r2(value_delta),
+			"stock_queue": "[]",
+		}
+	)
+	sle = frappe.get_doc(args)
+	sle.flags.ignore_permissions = True
+	sle.allow_negative_stock = True
+	sle.via_landed_cost_voucher = False
+	sle.insert()
+	sle.submit()
+	update_bin(scope, ipb, sle_dict.get("actual_qty") or 0)
+	return sle.name
+
+
+def update_bin(scope, ipb, qty_delta):
+	from erpnext.stock.utils import get_or_make_bin
+
+	if not scope.physical_warehouse:
+		return
+	bin_name = get_or_make_bin(scope.item_code, scope.physical_warehouse)
+	qty = flt(frappe.db.get_value("Bin", bin_name, "actual_qty")) + flt(qty_delta)
+	values = {
+		"actual_qty": qty,
+		"valuation_rate": flt(ipb.moving_avg_price),
+		# per-warehouse scope: bin value is exact; company scope: approximate
+		# the shelf value at scope MAP (design: Bin reads from IPB)
+		"stock_value": flt(ipb.closing_value) if scope.include_warehouse else flt(qty * flt(ipb.moving_avg_price), 2),
+	}
+	frappe.db.set_value("Bin", bin_name, values, update_modified=True)
+
+
+def post_gl(controller, posting_date, legs, ive_name, remarks=None):
+	"""legs: (account, signed_amount, against) — positive Dr, negative Cr."""
+	from erpnext.accounts.general_ledger import make_gl_entries
+
+	gl_map = []
+	for account, amount, against in legs:
+		amount = r2(amount)
+		if not amount:
+			continue
+		gl_map.append(
+			controller.get_gl_dict(
+				{
+					"account": account,
+					"against": against,
+					"debit": amount if amount > 0 else 0,
+					"credit": -amount if amount < 0 else 0,
+					"posting_date": posting_date,
+					"remarks": remarks or _("SAP MA valuation event {0}").format(ive_name),
+					"valuation_event_id": ive_name,
+					"cost_center": controller.get("cost_center")
+					or frappe.get_cached_value("Company", controller.company, "cost_center"),
+				}
+			)
+		)
+	if gl_map:
+		make_gl_entries(gl_map, merge_entries=False)
+
+
+# ----------------------------------------------------------------- main entry
+def post_via_sap_ma_kernel(controller, sl_entries):
+	"""Entry point for the fork's routing dispatch."""
+	if controller.docstatus == 2:
+		frappe.throw(
+			_("Direct cancellation is blocked for SAP Moving Average items. Use Create Cancellation."),
+			title=_("Immutable Ledger"),
+		)
+
+	company = controller.company
+	is_cancellation = bool(controller.get("is_cancellation"))
+	is_return = bool(controller.get("is_return"))
+
+	# deterministic lock order: sort by scope key then posting date
+	entries = sorted(
+		sl_entries, key=lambda s: (s.get("item_code"), s.get("warehouse") or "", str(s.get("posting_date")))
+	)
+
+	for sle in entries:
+		scope = ScopeState(company, sle.get("item_code"), sle.get("warehouse"))
+		posting_date = sle.get("posting_date")
+		period = assert_posting_allowed(company, posting_date)
+		open_period = get_open_period(company)
+
+		if period.status == "OPEN" or not open_period or period.name == open_period.name:
+			_post_current(controller, scope, period, sle, is_cancellation, is_return)
+		else:
+			_post_backdated(controller, scope, period, open_period, sle, is_return)
+
+
+def _classify(controller, sle, is_cancellation, is_return):
+	qty = flt(sle.get("actual_qty"))
+	if is_cancellation:
+		return "cancellation"
+	if is_return:
+		return "return_in" if qty > 0 else "return_out"
+	return "receipt" if qty > 0 else "issue"
+
+
+def _post_current(controller, scope, period, sle, is_cancellation, is_return):
+	ipb = scope.load(period)
+	kind = _classify(controller, sle, is_cancellation, is_return)
+	qty = flt(sle.get("actual_qty"))
+	source = (controller.doctype, controller.name, sle.get("voucher_detail_no"))
+	posting_date = sle.get("posting_date")
+	map_before = flt(ipb.moving_avg_price)
+
+	inventory_account = get_inventory_account(scope.company, scope.item_code, scope.physical_warehouse)
+	srbnb = frappe.get_cached_value("Company", scope.company, "stock_received_but_not_billed")
+	expense = _voucher_expense_account(controller, sle) or srbnb
+
+	if kind == "receipt":
+		rate = flt(sle.get("incoming_rate"))
+		result = _apply_receipt(ipb, qty, rate)
+		sme, ive = write_events(
+			scope, ipb, source=source, posting_date=posting_date,
+			movement_type="receipt", reason=result["reason"], qty_delta=qty,
+			value_delta=result["net_to_inventory"], map_before=map_before,
+			prd_amount=result["prd"], affects_map=1, stock_uom=sle.get("stock_uom"),
+		)
+		legs = [
+			(inventory_account, result["receipt_value"], srbnb),
+			(srbnb, -result["receipt_value"], inventory_account),
+		]
+		if result["prd"]:
+			prd_account = get_offset_account(scope.company, scope.item_code, scope.physical_warehouse, "prd")
+			legs += [(prd_account, result["prd"], inventory_account),
+				(inventory_account, -result["prd"], prd_account)]
+		scope.save(ipb, caused_by=ive, movement_event=sme, source=source)
+		write_sle(controller, sle, scope, ipb, result["net_to_inventory"])
+		post_gl(controller, posting_date, legs, ive)
+
+	elif kind == "issue":
+		rate = flt(ipb.frozen_map) if ipb.is_negative else flt(ipb.moving_avg_price)
+		if not get_sap_ma_setting(scope.company, "negative_stock_allowed") and flt(ipb.closing_qty) + qty < 0:
+			frappe.throw(
+				_("Insufficient stock for {0}: negative stock is not allowed.").format(scope.item_code),
+				title=_("Negative Stock Blocked"),
+			)
+		issue_value = r6(-qty * rate)  # qty is negative
+		ipb.issue_qty = r6(flt(ipb.issue_qty) - qty)
+		ipb.issue_value = r6(flt(ipb.issue_value) + issue_value)
+		recompute_closing(ipb)
+		_freeze_check(ipb)
+		sme, ive = write_events(
+			scope, ipb, source=source, posting_date=posting_date,
+			movement_type="issue", reason="issue", qty_delta=qty,
+			value_delta=-issue_value, map_before=map_before, stock_uom=sle.get("stock_uom"),
+		)
+		scope.save(ipb, caused_by=ive, movement_event=sme, source=source)
+		write_sle(controller, sle, scope, ipb, -issue_value)
+		post_gl(
+			controller, posting_date,
+			[(expense, issue_value, inventory_account), (inventory_account, -issue_value, expense)],
+			ive,
+		)
+
+	elif kind in ("return_in", "return_out"):
+		policy = get_return_valuation(scope.company, controller.doctype)
+		if policy == "With Reference" and controller.get("return_against"):
+			rate, reference_event = _original_rate(controller, sle)
+		else:
+			rate, reference_event = (flt(ipb.frozen_map) if ipb.is_negative else flt(ipb.moving_avg_price)), None
+		value = r6(qty * rate)  # signed with qty
+		if qty > 0:
+			ipb.receipt_qty = r6(flt(ipb.receipt_qty) + qty)
+			ipb.receipt_value = r6(flt(ipb.receipt_value) + value)
+		else:
+			ipb.issue_qty = r6(flt(ipb.issue_qty) - qty)
+			ipb.issue_value = r6(flt(ipb.issue_value) - value)
+		recompute_closing(ipb)
+		_freeze_check(ipb)
+		reason = "return_with_ref" if reference_event else "return_no_ref"
+		movement = "return_in" if qty > 0 else "return_out"
+		offset = expense if movement == "return_in" else srbnb
+		sme, ive = write_events(
+			scope, ipb, source=source, posting_date=posting_date,
+			movement_type=movement, reason=reason, qty_delta=qty, value_delta=value,
+			map_before=map_before, reference_event=reference_event,
+			affects_map=1 if reference_event else 0, stock_uom=sle.get("stock_uom"),
+		)
+		scope.save(ipb, caused_by=ive, movement_event=sme, source=source)
+		write_sle(controller, sle, scope, ipb, value)
+		post_gl(
+			controller, posting_date,
+			[(inventory_account, value, offset), (offset, -value, inventory_account)],
+			ive,
+		)
+
+	elif kind == "cancellation":
+		_post_cancellation(controller, scope, period, ipb, sle, source, inventory_account, expense)
+
+
+def _apply_receipt(ipb, qty, rate):
+	"""Receipt math on the IPB row — mirrors reference kernel receipt()."""
+	receipt_value = r6(qty * rate)
+	closing = flt(ipb.closing_qty)
+
+	if closing >= 0:
+		ipb.receipt_qty = r6(flt(ipb.receipt_qty) + qty)
+		ipb.receipt_value = r6(flt(ipb.receipt_value) + receipt_value)
+		ipb.total_received_since_zero = r6(flt(ipb.total_received_since_zero) + qty)
+		recompute_closing(ipb)
+		return {"reason": "receipt", "receipt_value": receipt_value, "net_to_inventory": receipt_value, "prd": 0}
+
+	frozen = flt(ipb.frozen_map)
+	if closing + qty <= 0:
+		prd = r6((rate - frozen) * qty)
+		net = r6(qty * frozen)
+		ipb.receipt_qty = r6(flt(ipb.receipt_qty) + qty)
+		ipb.receipt_value = r6(flt(ipb.receipt_value) + receipt_value)
+		ipb.prd_value = r6(flt(ipb.prd_value) - prd)
+		ipb.total_received_since_zero = r6(flt(ipb.total_received_since_zero) + qty)
+		recompute_closing(ipb)
+		return {"reason": "receipt_neg", "receipt_value": receipt_value, "net_to_inventory": net, "prd": prd}
+
+	clearing = r6(-closing)
+	excess = r6(qty - clearing)
+	prd = r6((rate - frozen) * clearing)
+	net = r6(clearing * frozen + excess * rate)
+	ipb.receipt_qty = r6(flt(ipb.receipt_qty) + qty)
+	ipb.receipt_value = r6(flt(ipb.receipt_value) + receipt_value)
+	ipb.prd_value = r6(flt(ipb.prd_value) - prd)
+	ipb.total_received_since_zero = excess  # fresh cycle
+	ipb.is_negative = 0
+	ipb.frozen_map = 0
+	recompute_closing(ipb)
+	ipb.moving_avg_price = rate  # RESET to the crossing receipt's price
+	return {"reason": "receipt_cross_zero", "receipt_value": receipt_value, "net_to_inventory": net, "prd": prd}
+
+
+def _freeze_check(ipb):
+	if flt(ipb.closing_qty) < 0 and not ipb.is_negative:
+		ipb.is_negative = 1
+		ipb.frozen_map = flt(ipb.moving_avg_price)
+	elif flt(ipb.closing_qty) >= 0 and ipb.is_negative:
+		ipb.is_negative = 0
+		ipb.frozen_map = 0
+	if flt(ipb.closing_qty) == 0:
+		ipb.total_received_since_zero = 0
+
+
+def _voucher_expense_account(controller, sle):
+	detail = sle.get("voucher_detail_no")
+	for row in controller.get("items") or []:
+		if row.name == detail:
+			return row.get("expense_account")
+	return None
+
+
+def _original_rate(controller, sle):
+	"""Rate + valuation event of the original document row a return references."""
+	detail = sle.get("voucher_detail_no")
+	original_detail = None
+	for row in controller.get("items") or []:
+		if row.name == detail:
+			original_detail = (
+				row.get("purchase_receipt_item") or row.get("dn_detail")
+				or row.get("delivery_note_item") or row.get("purchase_invoice_item")
+				or row.get("sales_invoice_item")
+			)
+			break
+	ive = None
+	if original_detail:
+		ive = frappe.db.get_value(
+			"Inventory Valuation Event",
+			{"source_detail_name": original_detail, "is_cancelled": 0},
+			["name", "value_delta", "qty_basis"],
+			as_dict=True,
+		)
+	if ive and flt(ive.qty_basis):
+		return abs(flt(ive.value_delta) / flt(ive.qty_basis)), ive.name
+	# fallback: the return row's own rate (copied from the original document)
+	return flt(sle.get("incoming_rate")) or flt(sle.get("outgoing_rate")), None
+
+
+def _post_cancellation(controller, scope, period, ipb, sle, source, inventory_account, expense):
+	"""Dated mirror of the original document's events; original stays intact."""
+	original = controller.get("cancellation_against")
+	if not original:
+		frappe.throw(_("Cancellation document must reference the original via Cancellation Against."))
+	detail = sle.get("voucher_detail_no")
+	row = next((x for x in controller.get("items") or [] if x.name == detail), None)
+	orig_detail = row and (
+		row.get("purchase_receipt_item") or row.get("dn_detail") or row.get("delivery_note_item")
+	)
+	filters = {"source_doctype": controller.doctype, "source_docname": original, "is_cancelled": 0}
+	if orig_detail:
+		filters["source_detail_name"] = orig_detail
+	originals = frappe.get_all(
+		"Inventory Valuation Event",
+		filters={**filters, "item_code": scope.item_code},
+		fields=["name", "value_delta", "qty_basis", "reason_code"],
+	)
+	if not originals:
+		frappe.throw(_("No valuation events found for {0} to cancel.").format(original))
+
+	posting_date = sle.get("posting_date")
+	map_before = flt(ipb.moving_avg_price)
+	qty = flt(sle.get("actual_qty"))  # already sign-flipped by the cancellation doc
+
+	orig = originals[0]
+	if frappe.db.exists("Inventory Valuation Event", {"reversal_of": orig.name, "is_cancelled": 0}):
+		frappe.throw(_("{0} is already reversed.").format(orig.name), title=_("Double Reversal Blocked"))
+
+	value = r6(-flt(orig.value_delta) * (abs(qty) / flt(orig.qty_basis)) if flt(orig.qty_basis) else -flt(orig.value_delta))
+	if qty > 0:
+		ipb.receipt_qty = r6(flt(ipb.receipt_qty) + qty)
+		ipb.receipt_value = r6(flt(ipb.receipt_value) + value)
+	elif qty < 0:
+		ipb.issue_qty = r6(flt(ipb.issue_qty) - qty)
+		ipb.issue_value = r6(flt(ipb.issue_value) - value)
+	else:
+		ipb.reval_value = r6(flt(ipb.reval_value) + value)
+	recompute_closing(ipb)
+	_freeze_check(ipb)
+
+	sme, ive = write_events(
+		scope, ipb, source=source, posting_date=posting_date,
+		movement_type="cancellation", reason="cancellation", qty_delta=qty,
+		value_delta=value, map_before=map_before, reversal_of=orig.name,
+		stock_uom=sle.get("stock_uom"),
+	)
+	scope.save(ipb, caused_by=ive, movement_event=sme, source=source)
+	write_sle(controller, sle, scope, ipb, value)
+	# mirror the original event's GL with swapped sides on the cancellation date
+	legs = []
+	for g in frappe.get_all(
+		"GL Entry",
+		filters={"valuation_event_id": orig.name, "is_cancelled": 0},
+		fields=["account", "debit", "credit"],
+	):
+		legs.append((g.account, flt(g.credit) - flt(g.debit), inventory_account))
+	post_gl(controller, posting_date, legs, ive)
+
+
+# ------------------------------------------------------------ backdated flow
+def _post_backdated(controller, scope, prior_period, open_period, sle, is_return):
+	"""Backdated posting into the PREV_OPEN_UNSETTLED period.
+
+	Receipt into positive prior: plain math in prior + carryover to current.
+	Receipt into negative prior: PRD math (Case A/B) in prior + carryover +
+	cross-period absorb in the current period (C1/C2). Issues: plain prior
+	math + carryover.
+	"""
+	qty = flt(sle.get("actual_qty"))
+	if is_return or controller.get("is_cancellation"):
+		frappe.throw(
+			_("Backdated returns/cancellations into a previous period are not supported; post into the current period."),
+		)
+
+	# lock order: previous then current
+	ipb_prior = scope.load(prior_period)
+	ipb_cur = scope.load(open_period)
+	source = (controller.doctype, controller.name, sle.get("voucher_detail_no"))
+	posting_date = sle.get("posting_date")
+	map_before_prior = flt(ipb_prior.moving_avg_price)
+	inventory_account = get_inventory_account(scope.company, scope.item_code, scope.physical_warehouse)
+	srbnb = frappe.get_cached_value("Company", scope.company, "stock_received_but_not_billed")
+
+	if qty <= 0:
+		# backdated issue at the prior period's MAP
+		rate = flt(ipb_prior.frozen_map) if ipb_prior.is_negative else flt(ipb_prior.moving_avg_price)
+		issue_value = r6(-qty * rate)
+		ipb_prior.issue_qty = r6(flt(ipb_prior.issue_qty) - qty)
+		ipb_prior.issue_value = r6(flt(ipb_prior.issue_value) + issue_value)
+		recompute_closing(ipb_prior)
+		_freeze_check(ipb_prior)
+		sme, ive = write_events(
+			scope, ipb_prior, source=source, posting_date=posting_date,
+			movement_type="issue", reason="issue", qty_delta=qty,
+			value_delta=-issue_value, map_before=map_before_prior, stock_uom=sle.get("stock_uom"),
+		)
+		scope.save(ipb_prior, caused_by=ive, movement_event=sme, source=source)
+		ipb_cur.carryover_qty = r6(flt(ipb_cur.carryover_qty) + qty)
+		ipb_cur.carryover_value = r6(flt(ipb_cur.carryover_value) - issue_value)
+		recompute_closing(ipb_cur)
+		_freeze_check(ipb_cur)
+		scope.save(ipb_cur, caused_by=ive, source=source)
+		write_sle(controller, sle, scope, ipb_cur, -issue_value)
+		expense = _voucher_expense_account(controller, sle) or srbnb
+		post_gl(
+			controller, posting_date,
+			[(expense, issue_value, inventory_account), (inventory_account, -issue_value, expense)],
+			ive,
+		)
+		return
+
+	rate = flt(sle.get("incoming_rate"))
+	prior_was_negative = bool(ipb_prior.is_negative)
+	result = _apply_receipt(ipb_prior, qty, rate)
+	sme, ive = write_events(
+		scope, ipb_prior, source=source, posting_date=posting_date,
+		movement_type="receipt", reason=result["reason"], qty_delta=qty,
+		value_delta=result["net_to_inventory"], map_before=map_before_prior,
+		prd_amount=result["prd"], affects_map=1, stock_uom=sle.get("stock_uom"),
+	)
+	scope.save(ipb_prior, caused_by=ive, movement_event=sme, source=source)
+
+	legs = [
+		(inventory_account, result["receipt_value"], srbnb),
+		(srbnb, -result["receipt_value"], inventory_account),
+	]
+	if result["prd"]:
+		prd_account = get_offset_account(scope.company, scope.item_code, scope.physical_warehouse, "prd")
+		legs += [(prd_account, result["prd"], inventory_account),
+			(inventory_account, -result["prd"], prd_account)]
+	post_gl(controller, posting_date, legs, ive)
+
+	# carryover into the open period
+	ipb_cur.carryover_qty = r6(flt(ipb_cur.carryover_qty) + qty)
+	ipb_cur.carryover_value = r6(flt(ipb_cur.carryover_value) + result["net_to_inventory"])
+
+	absorb = 0.0
+	if prior_was_negative:
+		# Case C: compute the current period's "should-have" inventory effect
+		cur_qty_before = flt(ipb_cur.closing_qty)
+		if cur_qty_before >= 0:
+			should_have = result["receipt_value"]  # C1 — current positive
+		else:
+			clearing_c = min(qty, -cur_qty_before)
+			excess_c = r6(qty - clearing_c)
+			should_have = r6(clearing_c * flt(ipb_cur.frozen_map) + excess_c * rate)  # C2
+		absorb = r2(should_have - result["net_to_inventory"])
+
+	crossed_current_zero = ipb_cur.is_negative and flt(ipb_cur.closing_qty) + qty >= 0
+	ipb_cur.total_received_since_zero = r6(flt(ipb_cur.total_received_since_zero) + qty)
+
+	if absorb:
+		ipb_cur.adjust_value = r6(flt(ipb_cur.adjust_value) + absorb)
+	recompute_closing(ipb_cur)
+	if crossed_current_zero:
+		ipb_cur.is_negative = 0
+		ipb_cur.frozen_map = 0
+		ipb_cur.moving_avg_price = rate
+	_freeze_check(ipb_cur)
+
+	absorb_ive = None
+	if absorb:
+		first_of_open = f"{open_period.period_year}-{open_period.period_month:02d}-01"
+		_, absorb_ive = write_events(
+			scope, ipb_cur, source=source, posting_date=first_of_open,
+			movement_type=None, reason="prd_split", qty_delta=0, value_delta=absorb,
+			map_before=flt(ipb_cur.moving_avg_price), caused_by=ive,
+		)
+		variance_account = get_offset_account(
+			scope.company, scope.item_code, scope.physical_warehouse, "negative_stock_adjustment"
+		)
+		post_gl(
+			controller, first_of_open,
+			[(inventory_account, absorb, variance_account), (variance_account, -absorb, inventory_account)],
+			absorb_ive,
+		)
+
+	scope.save(ipb_cur, caused_by=absorb_ive or ive, source=source)
+	write_sle(controller, sle, scope, ipb_cur, result["net_to_inventory"] + absorb)
+
+
+# ------------------------------------------------------- value-only postings
+def post_value_event(company, item_code, warehouse, *, source, posting_date, reason,
+		value_delta, offset_account, qty_delta=0.0, movement_type=None,
+		expense_portion=0.0, offset_is_credit=True):
+	"""Shared writer for MR21 revaluation / stock count / LCV / invoice-diff
+	events posted by the transaction-layer doctypes."""
+	scope = ScopeState(company, item_code, warehouse)
+	period = assert_posting_allowed(company, posting_date)
+	ipb = scope.load(period)
+	map_before = flt(ipb.moving_avg_price)
+	inventory_account = get_inventory_account(company, item_code, warehouse)
+
+	if reason == "revaluation":
+		if flt(ipb.closing_qty) <= 0:
+			frappe.throw(_("Revaluation requires positive on-hand quantity for {0}.").format(item_code))
+		ipb.reval_value = r6(flt(ipb.reval_value) + value_delta)
+	elif reason == "count_diff":
+		rate = flt(ipb.frozen_map) if ipb.is_negative else flt(ipb.moving_avg_price)
+		value_delta = r6(qty_delta * rate)
+		ipb.adjust_qty = r6(flt(ipb.adjust_qty) + qty_delta)
+		ipb.adjust_value = r6(flt(ipb.adjust_value) + value_delta)
+	elif reason in ("landed_cost", "invoice_diff", "fx_adjust"):
+		ipb.reval_value = r6(flt(ipb.reval_value) + value_delta)
+	else:
+		frappe.throw(_("Unsupported value event {0}").format(reason))
+
+	recompute_closing(ipb)
+	if reason == "count_diff":
+		# count difference never moves MAP
+		ipb.moving_avg_price = map_before if not ipb.is_negative else ipb.moving_avg_price
+	_freeze_check(ipb)
+
+	sme, ive = write_events(
+		scope, ipb, source=source, posting_date=posting_date,
+		movement_type=movement_type, reason=reason, qty_delta=qty_delta,
+		value_delta=value_delta, map_before=map_before,
+		expense_portion=expense_portion, affects_map=0 if reason == "count_diff" else 1,
+	)
+	scope.save(ipb, caused_by=ive, movement_event=sme, source=source)
+
+	legs = [(inventory_account, value_delta, offset_account)]
+	total_offset = value_delta + (expense_portion or 0)
+	if expense_portion:
+		price_diff = get_offset_account(company, item_code, warehouse, "price_difference")
+		legs.append((price_diff, expense_portion, offset_account))
+	legs.append((offset_account, -total_offset, inventory_account))
+
+	class _Ctl:  # minimal gl_dict context for standalone value events
+		def get_gl_dict(self, row):
+			row.setdefault("company", company)
+			row.setdefault("posting_date", posting_date)
+			row.setdefault("voucher_type", source[0])
+			row.setdefault("voucher_no", source[1])
+			return frappe._dict(row)
+
+		def get(self, key, default=None):
+			return default
+
+	ctl = _Ctl()
+	ctl.company = company
+	post_gl(ctl, posting_date, legs, ive)
+	return ive
+
+
+def get_stock_ratio(company, item_code, warehouse):
+	scope = ScopeState(company, item_code, warehouse)
+	row = frappe.get_all(
+		"Inventory Period Balance",
+		filters={"company": company, "item_code": item_code, "warehouse": scope.warehouse or ""},
+		fields=["closing_qty", "total_received_since_zero"],
+		order_by="period_year desc, period_month desc",
+		limit=1,
+	)
+	if not row or not flt(row[0].total_received_since_zero):
+		return 0.0
+	return min(max(flt(row[0].closing_qty) / flt(row[0].total_received_since_zero), 0.0), 1.0)

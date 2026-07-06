@@ -25,7 +25,7 @@ def kernel_only_insert(doc, method=None):
 
 def block_update(doc, method=None):
 	"""on_update guard: no field of a persisted legal row may change."""
-	if doc.is_new():
+	if doc.is_new() or doc.flags.in_insert:
 		return
 	if frappe.flags.get(KERNEL_FLAG) and getattr(doc, "_sap_allowed_update", False):
 		# The kernel may flip is_cancelled as part of a reversal pairing; nothing else.

@@ -35,7 +35,7 @@ class InventoryPeriodBalance(Document):
 	def on_update(self):
 		# Mutable only through the kernel (buckets), never by hand. Opening is
 		# fixed forever; the kernel appends backdated deltas to carryover_*.
-		if self.is_new():
+		if self.is_new() or self.flags.in_insert:
 			return
 		if not frappe.flags.get(KERNEL_FLAG):
 			frappe.throw(
