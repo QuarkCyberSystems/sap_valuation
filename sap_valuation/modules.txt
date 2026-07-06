@@ -1,1 +1,2 @@
 SAP Valuation
+SAP Moving Average

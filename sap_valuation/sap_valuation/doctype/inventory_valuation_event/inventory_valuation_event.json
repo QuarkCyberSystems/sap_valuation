@@ -1,0 +1,342 @@
+{
+ "allow_rename": 0,
+ "autoname": "IVE-.YYYY.-.######",
+ "creation": "2026-07-06 12:00:00.000000",
+ "custom": 0,
+ "description": "Immutable inventory value-change log; source of truth for stock GL.",
+ "doctype": "DocType",
+ "editable_grid": 1,
+ "engine": "InnoDB",
+ "field_order": [
+  "sec_scope",
+  "company",
+  "item_code",
+  "warehouse",
+  "col_scope",
+  "period_year",
+  "period_month",
+  "posting_date",
+  "entry_date",
+  "sec_source",
+  "source_doctype",
+  "source_docname",
+  "col_source",
+  "source_detail_name",
+  "sec_valuation",
+  "reason_code",
+  "qty_basis",
+  "value_delta",
+  "affects_map",
+  "col_valuation",
+  "inventory_portion",
+  "expense_portion",
+  "prd_amount",
+  "fx_variance",
+  "exchange_rate_at_receipt",
+  "sec_map",
+  "map_before",
+  "map_after",
+  "col_map",
+  "map_frozen",
+  "sec_links",
+  "movement_event_id",
+  "reference_receipt_event",
+  "col_links",
+  "original_period",
+  "caused_by_event_id",
+  "reversal_of",
+  "is_cancelled"
+ ],
+ "fields": [
+  {
+   "fieldname": "sec_scope",
+   "fieldtype": "Section Break",
+   "label": "Scope & Dates"
+  },
+  {
+   "fieldname": "company",
+   "fieldtype": "Link",
+   "in_standard_filter": 1,
+   "label": "Company",
+   "options": "Company",
+   "reqd": 1,
+   "search_index": 1
+  },
+  {
+   "fieldname": "item_code",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Item",
+   "options": "Item",
+   "reqd": 1,
+   "search_index": 1
+  },
+  {
+   "fieldname": "warehouse",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Warehouse",
+   "options": "Warehouse",
+   "search_index": 1
+  },
+  {
+   "fieldname": "col_scope",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "period_year",
+   "fieldtype": "Int",
+   "in_standard_filter": 1,
+   "label": "Period Year",
+   "search_index": 1
+  },
+  {
+   "fieldname": "period_month",
+   "fieldtype": "Int",
+   "in_standard_filter": 1,
+   "label": "Period Month",
+   "search_index": 1
+  },
+  {
+   "fieldname": "posting_date",
+   "fieldtype": "Date",
+   "in_list_view": 1,
+   "label": "Posting Date",
+   "reqd": 1,
+   "search_index": 1
+  },
+  {
+   "description": "When the row was actually written; differs from posting_date on backdated entries.",
+   "fieldname": "entry_date",
+   "fieldtype": "Datetime",
+   "label": "Entry Date"
+  },
+  {
+   "fieldname": "sec_source",
+   "fieldtype": "Section Break",
+   "label": "Source Document"
+  },
+  {
+   "fieldname": "source_doctype",
+   "fieldtype": "Link",
+   "label": "Source DocType",
+   "options": "DocType",
+   "search_index": 1
+  },
+  {
+   "fieldname": "source_docname",
+   "fieldtype": "Dynamic Link",
+   "in_list_view": 1,
+   "label": "Source Document",
+   "options": "source_doctype",
+   "search_index": 1
+  },
+  {
+   "fieldname": "col_source",
+   "fieldtype": "Column Break"
+  },
+  {
+   "description": "Row-level reference (voucher_detail_no equivalent).",
+   "fieldname": "source_detail_name",
+   "fieldtype": "Data",
+   "label": "Source Row"
+  },
+  {
+   "fieldname": "sec_valuation",
+   "fieldtype": "Section Break",
+   "label": "Valuation"
+  },
+  {
+   "fieldname": "reason_code",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "label": "Reason Code",
+   "options": "\nreceipt\nissue\nlanded_cost\ninvoice_diff\ncount_diff\nrevaluation\nreturn_with_ref\nreturn_no_ref\ncancellation\ntransfer\nreceipt_neg\nreceipt_cross_zero\nprd_split\nfx_adjust\nrounding_cleanup",
+   "reqd": 1,
+   "search_index": 1
+  },
+  {
+   "fieldname": "qty_basis",
+   "fieldtype": "Float",
+   "label": "Qty Basis",
+   "precision": "6"
+  },
+  {
+   "description": "Signed inventory value change in company currency.",
+   "fieldname": "value_delta",
+   "fieldtype": "Currency",
+   "in_list_view": 1,
+   "label": "Value Delta"
+  },
+  {
+   "default": "0",
+   "fieldname": "affects_map",
+   "fieldtype": "Check",
+   "label": "Affects MAP"
+  },
+  {
+   "fieldname": "col_valuation",
+   "fieldtype": "Column Break"
+  },
+  {
+   "description": "Stock-ratio inventory share for landed_cost / invoice_diff.",
+   "fieldname": "inventory_portion",
+   "fieldtype": "Currency",
+   "label": "Inventory Portion"
+  },
+  {
+   "fieldname": "expense_portion",
+   "fieldtype": "Currency",
+   "label": "Expense Portion"
+  },
+  {
+   "description": "Price Revaluation Difference component (negative-stock receipts).",
+   "fieldname": "prd_amount",
+   "fieldtype": "Currency",
+   "label": "PRD Amount"
+  },
+  {
+   "fieldname": "fx_variance",
+   "fieldtype": "Currency",
+   "label": "FX Variance"
+  },
+  {
+   "fieldname": "exchange_rate_at_receipt",
+   "fieldtype": "Float",
+   "label": "Exchange Rate at Receipt",
+   "precision": "9"
+  },
+  {
+   "fieldname": "sec_map",
+   "fieldtype": "Section Break",
+   "label": "MAP Audit"
+  },
+  {
+   "fieldname": "map_before",
+   "fieldtype": "Float",
+   "label": "MAP Before",
+   "precision": "6",
+   "read_only": 1
+  },
+  {
+   "fieldname": "map_after",
+   "fieldtype": "Float",
+   "label": "MAP After",
+   "precision": "6",
+   "read_only": 1
+  },
+  {
+   "fieldname": "col_map",
+   "fieldtype": "Column Break"
+  },
+  {
+   "default": "0",
+   "fieldname": "map_frozen",
+   "fieldtype": "Check",
+   "label": "MAP Frozen",
+   "read_only": 1
+  },
+  {
+   "fieldname": "sec_links",
+   "fieldtype": "Section Break",
+   "label": "Links"
+  },
+  {
+   "fieldname": "movement_event_id",
+   "fieldtype": "Link",
+   "label": "Movement Event",
+   "options": "Stock Movement Event",
+   "search_index": 1
+  },
+  {
+   "description": "For return-with-reference: the original receipt/issue valuation event.",
+   "fieldname": "reference_receipt_event",
+   "fieldtype": "Link",
+   "label": "Reference Receipt Event",
+   "options": "Inventory Valuation Event"
+  },
+  {
+   "fieldname": "col_links",
+   "fieldtype": "Column Break"
+  },
+  {
+   "description": "Economic origin period for post-settlement forward corrections (e.g. 2026-04).",
+   "fieldname": "original_period",
+   "fieldtype": "Data",
+   "label": "Original Period"
+  },
+  {
+   "description": "System-generated linkage (e.g. cross-period PRD absorb entries).",
+   "fieldname": "caused_by_event_id",
+   "fieldtype": "Link",
+   "label": "Caused By Event",
+   "options": "Inventory Valuation Event"
+  },
+  {
+   "fieldname": "reversal_of",
+   "fieldtype": "Link",
+   "label": "Reversal Of",
+   "options": "Inventory Valuation Event",
+   "search_index": 1
+  },
+  {
+   "default": "0",
+   "fieldname": "is_cancelled",
+   "fieldtype": "Check",
+   "label": "Is Cancelled"
+  }
+ ],
+ "idx": 0,
+ "in_create": 1,
+ "index_web_pages_for_search": 0,
+ "is_submittable": 0,
+ "istable": 0,
+ "links": [],
+ "modified": "2026-07-06 12:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "SAP Valuation",
+ "name": "Inventory Valuation Event",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "System Manager"
+  },
+  {
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "Stock Manager"
+  },
+  {
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "Accounts Manager"
+  },
+  {
+   "read": 1,
+   "report": 1,
+   "role": "Stock User"
+  },
+  {
+   "read": 1,
+   "report": 1,
+   "role": "Accounts User"
+  }
+ ],
+ "sort_field": "creation",
+ "sort_order": "DESC",
+ "states": [],
+ "track_changes": 0
+}

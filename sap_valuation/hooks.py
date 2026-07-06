@@ -5,6 +5,35 @@ app_description = "SAP-style Moving Average and Standard Cost valuation kernels 
 app_email = "vivek@quarkcs.com"
 app_license = "gpl-3.0"
 
+required_apps = ["erpnext"]
+
+# Valuation-method -> posting-kernel registry, consulted by the erpnext fork's
+# routing dispatch before SLE creation. "SAP Standard Cost" registers here in
+# Phase 3 without further core edits.
+sap_valuation_kernels = {
+	"SAP Moving Average": "sap_valuation.sap_moving_average.kernel.post_via_sap_ma_kernel",
+}
+
+# Incoming-rate resolver for kernel-valued items (consulted by the fork's
+# erpnext.stock.utils.get_incoming_rate instead of SLE-based resolution).
+sap_valuation_incoming_rate = "sap_valuation.shared.routing.get_incoming_rate"
+
+after_migrate = ["sap_valuation.setup.custom_fields.after_migrate"]
+after_install = ["sap_valuation.setup.custom_fields.apply_custom_fields"]
+
+# Universal cancellation rule: docstatus 1 -> 2 is never allowed for documents
+# containing SAP-valuation items; a dated Cancellation document is used instead.
+_cancel_guard = {"before_cancel": "sap_valuation.overrides.cancel_guard.block_direct_cancel"}
+doc_events = {
+	"Purchase Receipt": _cancel_guard,
+	"Delivery Note": _cancel_guard,
+	"Stock Entry": _cancel_guard,
+	"Purchase Invoice": _cancel_guard,
+	"Sales Invoice": _cancel_guard,
+	"Subcontracting Receipt": _cancel_guard,
+	"Landed Cost Voucher": _cancel_guard,
+}
+
 # Apps
 # ------------------
 
