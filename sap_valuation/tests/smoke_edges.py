@@ -256,6 +256,65 @@ def run(commit=False):
 	check("SI update_stock issue at MAP", flt(c.closing_qty) == 6 and flt(c.closing_value, 2) == 60,
 		f"{c.closing_qty}/{c.closing_value}")
 
+	# ============ count GAIN valued at period MAP (matrix row 3, second half)
+	it = make_item("_SMK-GAIN")
+	make_pr(it, wh, 10, 10)
+	sc = frappe.get_doc({
+		"doctype": "Stock Count", "company": COMPANY, "posting_date": nowdate(),
+		"items": [{"item_code": it, "warehouse": wh, "counted_qty": 13}],
+	})
+	sc.insert(ignore_permissions=True)
+	sc.submit()
+	c = ipb(it)
+	sme = frappe.get_all("Stock Movement Event", filters={"source_docname": sc.name},
+		pluck="movement_type")
+	check("count gain +3 at MAP, MAP stable",
+		flt(c.closing_qty) == 13 and flt(c.closing_value, 2) == 130
+		and flt(c.moving_avg_price, 6) == 10 and sme == ["count_gain"],
+		f"{c.closing_qty}/{c.closing_value}/{c.moving_avg_price}/{sme}")
+
+	# ============ SALES return with reference at original issue cost (matrix row 4)
+	it = make_item("_SMK-SRET")
+	make_pr(it, wh, 100, 10)
+	dn = make_dn(it, wh, 30)                              # issue at MAP 10
+	make_pr(it, wh, 50, 20)                               # MAP now (700+1000)/120
+	sr = frappe.get_doc({
+		"doctype": "Delivery Note", "company": COMPANY, "customer": "_SMK Customer",
+		"posting_date": nowdate(), "is_return": 1, "return_against": dn.name,
+		"items": [{
+			"item_code": it, "qty": -10, "rate": 25, "warehouse": wh,
+			"dn_detail": dn.items[0].name,
+		}],
+	})
+	sr.insert(ignore_permissions=True)
+	sr.submit()
+	ive = frappe.get_all("Inventory Valuation Event",
+		filters={"source_docname": sr.name}, fields=["reason_code", "value_delta"])
+	c = ipb(it)
+	check("sales return w/ref at original issue cost 10 (+100)",
+		ive and ive[0].reason_code == "return_with_ref" and flt(ive[0].value_delta, 2) == 100.00,
+		str(ive))
+	check("sales return MAP recalc (1800/130)",
+		flt(c.moving_avg_price, 4) == flt(1800 / 130, 4), str(c.moving_avg_price))
+
+	# ============ ineligible cancellation: original period settled/frozen (matrix row 7)
+	it = make_item("_SMK-FRZ")
+	pr_old = make_pr(it, wh, 10, 10, posting_date=str(prior))
+	prior_period_name = frappe.db.get_value(
+		"Inventory Period", {"company": COMPANY, "period_year": prior.year,
+			"period_month": prior.month})
+	frappe.db.set_value("Inventory Period", prior_period_name, "status", "SETTLED_FROZEN")
+	from sap_valuation.sap_moving_average.cancellation import make_cancellation
+	cxl_name = make_cancellation("Purchase Receipt", pr_old.name)
+	cxl = frappe.get_doc("Purchase Receipt", cxl_name)
+	try:
+		cxl.submit()
+		check("frozen-period cancellation blocked", False, "submit succeeded")
+	except frappe.ValidationError as e:
+		check("frozen-period cancellation blocked",
+			"Not Eligible" in str(e) or "no longer be cancelled" in str(e), str(e)[:120])
+	frappe.db.set_value("Inventory Period", prior_period_name, "status", "PREV_OPEN_UNSETTLED")
+
 	failed = [x for x in CHECKS if not x[1]]
 	print(f"\n{len(CHECKS) - len(failed)}/{len(CHECKS)} checks passed")
 	if commit and not failed:

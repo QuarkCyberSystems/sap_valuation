@@ -687,6 +687,27 @@ def _post_cancellation(controller, scope, period, ipb, sle, source, inventory_ac
 	if frappe.db.exists("Inventory Valuation Event", {"reversal_of": orig.name, "is_cancelled": 0}):
 		frappe.throw(_("{0} is already reversed.").format(orig.name), title=_("Double Reversal Blocked"))
 
+	# Cancellation matrix (signed plan): a Cancellation document is only
+	# eligible while the ORIGINAL's period is still open or previous-open.
+	# Settled/frozen periods take forward corrections instead.
+	orig_period = frappe.db.get_value(
+		"Inventory Valuation Event", orig.name, ["period_year", "period_month"], as_dict=True
+	)
+	orig_period_status = frappe.db.get_value(
+		"Inventory Period",
+		{"company": scope.company, "period_year": orig_period.period_year,
+			"period_month": orig_period.period_month},
+		"status",
+	)
+	if orig_period_status not in ("OPEN", "PREV_OPEN_UNSETTLED"):
+		frappe.throw(
+			_(
+				"The original posting's period {0}-{1:02d} is {2}; it can no longer be cancelled. "
+				"Post a forward correction in the current open period with Original Period set."
+			).format(orig_period.period_year, orig_period.period_month, orig_period_status or _("closed")),
+			title=_("Cancellation Not Eligible"),
+		)
+
 	value = r6(-flt(orig.value_delta) * (abs(qty) / flt(orig.qty_basis)) if flt(orig.qty_basis) else -flt(orig.value_delta))
 	if qty > 0:
 		ipb.receipt_qty = r6(flt(ipb.receipt_qty) + qty)
