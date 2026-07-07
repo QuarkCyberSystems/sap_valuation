@@ -25,6 +25,8 @@ sap_valuation_landed_cost = "sap_valuation.sap_moving_average.landed_cost.handle
 after_migrate = ["sap_valuation.setup.custom_fields.after_migrate"]
 after_install = ["sap_valuation.setup.custom_fields.apply_custom_fields"]
 
+app_include_js = "/assets/sap_valuation/js/cancellation_button.js"
+
 # Universal cancellation rule: docstatus 1 -> 2 is never allowed for documents
 # containing SAP-valuation items; a dated Cancellation document is used instead.
 _cancel_guard = {"before_cancel": "sap_valuation.overrides.cancel_guard.block_direct_cancel"}
@@ -32,7 +34,10 @@ doc_events = {
 	"Purchase Receipt": _cancel_guard,
 	"Delivery Note": _cancel_guard,
 	"Stock Entry": _cancel_guard,
-	"Purchase Invoice": _cancel_guard,
+	"Purchase Invoice": {
+		**_cancel_guard,
+		"on_submit": "sap_valuation.sap_moving_average.invoice_diff.on_purchase_invoice_submit",
+	},
 	"Sales Invoice": _cancel_guard,
 	"Subcontracting Receipt": _cancel_guard,
 	"Landed Cost Voucher": _cancel_guard,

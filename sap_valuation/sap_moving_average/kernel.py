@@ -318,6 +318,10 @@ def post_via_sap_ma_kernel(controller, sl_entries):
 		sl_entries, key=lambda s: (s.get("item_code"), s.get("warehouse") or "", str(s.get("posting_date")))
 	)
 
+	transfer_pairs, entries = _pair_transfers(controller, entries)
+	for out_sle, in_sle in transfer_pairs:
+		_post_transfer(controller, out_sle, in_sle)
+
 	for sle in entries:
 		scope = ScopeState(company, sle.get("item_code"), sle.get("warehouse"))
 		posting_date = sle.get("posting_date")
@@ -328,6 +332,106 @@ def post_via_sap_ma_kernel(controller, sl_entries):
 			_post_current(controller, scope, period, sle, is_cancellation, is_return)
 		else:
 			_post_backdated(controller, scope, period, open_period, sle, is_return)
+
+
+def _pair_transfers(controller, entries):
+	"""Detect two-leg transfers (same voucher row, one negative + one positive
+	SLE) and split them from the normal flow."""
+	if controller.doctype != "Stock Entry" or controller.get("is_cancellation"):
+		return [], entries
+
+	by_detail = {}
+	for sle in entries:
+		by_detail.setdefault(sle.get("voucher_detail_no"), []).append(sle)
+
+	pairs, singles = [], []
+	for group in by_detail.values():
+		if len(group) == 2 and flt(group[0].get("actual_qty")) * flt(group[1].get("actual_qty")) < 0:
+			out_sle = min(group, key=lambda s: flt(s.get("actual_qty")))
+			in_sle = max(group, key=lambda s: flt(s.get("actual_qty")))
+			pairs.append((out_sle, in_sle))
+		else:
+			singles.extend(group)
+	return pairs, singles
+
+
+def _post_transfer(controller, out_sle, in_sle):
+	"""Warehouse transfer of a kernel item.
+
+	Company-scope items (valuation_includes_warehouse OFF): physical-only —
+	movement events on both legs, one value-neutral IVE, no GL (signed plan).
+	Warehouse-scope items (ON): issue at the source scope's MAP, receipt into
+	the destination scope at that unit cost; GL moves value between the two
+	inventory accounts.
+	"""
+	company = controller.company
+	item_code = out_sle.get("item_code")
+	qty = flt(in_sle.get("actual_qty"))
+	posting_date = out_sle.get("posting_date")
+	period = assert_posting_allowed(company, posting_date)
+	source = (controller.doctype, controller.name, out_sle.get("voucher_detail_no"))
+	include_wh = frappe.get_cached_value("Item", item_code, "valuation_includes_warehouse")
+
+	if not include_wh:
+		scope = ScopeState(company, item_code, out_sle.get("warehouse"))
+		ipb = scope.load(period)
+		map_before = flt(ipb.moving_avg_price)
+		# quantity is scope-neutral; record both physical legs for audit
+		for sle, movement in ((out_sle, "transfer_out"), (in_sle, "transfer_in")):
+			scope.physical_warehouse = sle.get("warehouse")
+			sme, ive = write_events(
+				scope, ipb, source=source, posting_date=posting_date,
+				movement_type=movement, reason="transfer",
+				qty_delta=flt(sle.get("actual_qty")), value_delta=0,
+				map_before=map_before, stock_uom=sle.get("stock_uom"),
+			)
+			write_sle(controller, sle, scope, ipb, 0)
+		scope.save(ipb, caused_by=ive, movement_event=sme, source=source)
+		return
+
+	# warehouse-scope: two independent scopes, value moves at source MAP
+	out_scope = ScopeState(company, item_code, out_sle.get("warehouse"))
+	in_scope = ScopeState(company, item_code, in_sle.get("warehouse"))
+	ipb_out = out_scope.load(period)
+	ipb_in = in_scope.load(period)
+
+	rate = flt(ipb_out.frozen_map) if ipb_out.is_negative else flt(ipb_out.moving_avg_price)
+	value = r6(qty * rate)
+
+	map_before_out = flt(ipb_out.moving_avg_price)
+	ipb_out.issue_qty = r6(flt(ipb_out.issue_qty) + qty)
+	ipb_out.issue_value = r6(flt(ipb_out.issue_value) + value)
+	recompute_closing(ipb_out)
+	_freeze_check(ipb_out)
+	sme_out, ive_out = write_events(
+		out_scope, ipb_out, source=source, posting_date=posting_date,
+		movement_type="transfer_out", reason="transfer", qty_delta=-qty,
+		value_delta=-value, map_before=map_before_out, stock_uom=out_sle.get("stock_uom"),
+	)
+	out_scope.save(ipb_out, caused_by=ive_out, movement_event=sme_out, source=source)
+	write_sle(controller, out_sle, out_scope, ipb_out, -value)
+
+	map_before_in = flt(ipb_in.moving_avg_price)
+	result = _apply_receipt(ipb_in, qty, rate)
+	sme_in, ive_in = write_events(
+		in_scope, ipb_in, source=source, posting_date=posting_date,
+		movement_type="transfer_in", reason="transfer", qty_delta=qty,
+		value_delta=result["net_to_inventory"], map_before=map_before_in,
+		prd_amount=result["prd"], affects_map=1, stock_uom=in_sle.get("stock_uom"),
+	)
+	in_scope.save(ipb_in, caused_by=ive_in, movement_event=sme_in, source=source)
+	write_sle(controller, in_sle, in_scope, ipb_in, result["net_to_inventory"])
+
+	source_account = get_inventory_account(company, item_code, out_sle.get("warehouse"))
+	dest_account = get_inventory_account(company, item_code, in_sle.get("warehouse"))
+	if source_account != dest_account:
+		post_gl(
+			controller, posting_date,
+			[(dest_account, value, source_account), (source_account, -value, dest_account)],
+			ive_in,
+		)
+
+	maybe_rounding_cleanup(controller, out_scope, ipb_out, source, posting_date)
 
 
 def _classify(controller, sle, is_cancellation, is_return):
@@ -432,6 +536,8 @@ def _post_current(controller, scope, period, sle, is_cancellation, is_return):
 	elif kind == "cancellation":
 		_post_cancellation(controller, scope, period, ipb, sle, source, inventory_account, expense)
 
+	maybe_rounding_cleanup(controller, scope, ipb, source, posting_date)
+
 
 def _apply_receipt(ipb, qty, rate):
 	"""Receipt math on the IPB row — mirrors reference kernel receipt()."""
@@ -480,6 +586,40 @@ def _freeze_check(ipb):
 		ipb.frozen_map = 0
 	if flt(ipb.closing_qty) == 0:
 		ipb.total_received_since_zero = 0
+
+
+def maybe_rounding_cleanup(controller, scope, ipb, source, posting_date):
+	"""Mandatory zero-qty cleanup (signed plan): when closing_qty hits 0 with a
+	residual value within tolerance, clear it to Stock Rounding Adjustment and
+	reset MAP. Called after any posting that can zero the quantity."""
+	if flt(ipb.closing_qty) != 0:
+		return
+	residual = r2(flt(ipb.closing_value))
+	tolerance = flt(get_sap_ma_setting(scope.company, "rounding_tolerance")) or 0.01
+	map_before = flt(ipb.moving_avg_price)
+	if residual and abs(residual) <= tolerance * 100:
+		ipb.reval_value = r6(flt(ipb.reval_value) - residual)
+		recompute_closing(ipb)
+		ipb.moving_avg_price = 0
+		_, ive = write_events(
+			scope, ipb, source=source, posting_date=posting_date,
+			movement_type=None, reason="rounding_cleanup", qty_delta=0,
+			value_delta=-residual, map_before=map_before,
+		)
+		scope.save(ipb, caused_by=ive, source=source)
+		inventory_account = get_inventory_account(scope.company, scope.item_code, scope.physical_warehouse)
+		rounding_account = get_offset_account(
+			scope.company, scope.item_code, scope.physical_warehouse, "rounding_cleanup"
+		)
+		post_gl(
+			controller, posting_date,
+			[(rounding_account, residual, inventory_account), (inventory_account, -residual, rounding_account)],
+			ive,
+		)
+	elif not residual:
+		if map_before:
+			ipb.moving_avg_price = 0
+			scope.save(ipb, source=source)
 
 
 def _voucher_expense_account(controller, sle):
@@ -706,7 +846,7 @@ def _post_backdated(controller, scope, prior_period, open_period, sle, is_return
 # ------------------------------------------------------- value-only postings
 def post_value_event(company, item_code, warehouse, *, source, posting_date, reason,
 		value_delta, offset_account, qty_delta=0.0, movement_type=None,
-		expense_portion=0.0, offset_is_credit=True):
+		expense_portion=0.0, fx_variance=0.0, offset_is_credit=True):
 	"""Shared writer for MR21 revaluation / stock count / LCV / invoice-diff
 	events posted by the transaction-layer doctypes."""
 	scope = ScopeState(company, item_code, warehouse)
@@ -739,15 +879,19 @@ def post_value_event(company, item_code, warehouse, *, source, posting_date, rea
 		scope, ipb, source=source, posting_date=posting_date,
 		movement_type=movement_type, reason=reason, qty_delta=qty_delta,
 		value_delta=value_delta, map_before=map_before,
-		expense_portion=expense_portion, affects_map=0 if reason == "count_diff" else 1,
+		expense_portion=expense_portion, fx_variance=fx_variance,
+		affects_map=0 if reason == "count_diff" else 1,
 	)
 	scope.save(ipb, caused_by=ive, movement_event=sme, source=source)
 
 	legs = [(inventory_account, value_delta, offset_account)]
-	total_offset = value_delta + (expense_portion or 0)
+	total_offset = value_delta + (expense_portion or 0) + (fx_variance or 0)
 	if expense_portion:
 		price_diff = get_offset_account(company, item_code, warehouse, "price_difference")
 		legs.append((price_diff, expense_portion, offset_account))
+	if fx_variance:
+		fx_account = get_offset_account(company, item_code, warehouse, "fx_gain_loss")
+		legs.append((fx_account, fx_variance, offset_account))
 	legs.append((offset_account, -total_offset, inventory_account))
 
 	class _Ctl:  # minimal gl_dict context for standalone value events
