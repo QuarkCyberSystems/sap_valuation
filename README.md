@@ -1,12 +1,12 @@
-# SAP Valuation
+# SAP Inspired Valuation
 
 SAP-inspired **Moving Average** and **Standard Cost** valuation kernels for ERPNext,
 built on an **immutable stock ledger**: posted events are never modified or
 deleted — every correction is a new, dated, linked event.
 
-The SAP Moving Average (MAP) kernel is complete and UAT-ready. The SAP Standard
-Cost kernel (monthly/year-to-date variance settlement) is the next phase and
-plugs into the same foundation.
+The SAP Moving Average (MAP) kernel is complete. The SAP Standard Cost kernel
+(monthly/year-to-date variance settlement) is the next phase and plugs into
+the same foundation.
 
 ---
 
@@ -180,7 +180,7 @@ closing value) after every scenario.
 | Component | State |
 |---|---|
 | Shared foundation (events, periods, close gate, settings, routing) | ✅ complete |
-| SAP Moving Average kernel + MR21/MI07 + cancellation + UI | ✅ complete, UAT-ready |
+| SAP Moving Average kernel + MR21/MI07 + cancellation + UI | ✅ complete |
 | SAP Standard Cost kernel (MTD/YTD settlement) | 🔜 next phase |
 
 ## Contributing
