@@ -1,6 +1,6 @@
 # SAP Valuation
 
-SAP-style **Moving Average** and **Standard Cost** valuation kernels for ERPNext,
+SAP-inspired **Moving Average** and **Standard Cost** valuation kernels for ERPNext,
 built on an **immutable stock ledger**: posted events are never modified or
 deleted — every correction is a new, dated, linked event.
 
@@ -26,8 +26,8 @@ and GL entries are deleted and recreated to match. That design has real costs:
 - **Unbounded propagation** — one backdated document can silently re-value
   months of downstream transactions.
 
-SAP's inventory accounting takes the opposite stance: *first correct the past
-explicitly, then value the future*. Prices are period-based; backdated postings
+The approach popularised by SAP takes the opposite stance: *first correct the
+past explicitly, then value the future*. Prices are period-based; backdated postings
 update their own period and flow forward through opening balances; price gaps
 against negative stock post to a dedicated difference account (PRD); nothing is
 ever recomputed retroactively.

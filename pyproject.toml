@@ -3,7 +3,7 @@ name = "sap_valuation"
 authors = [
     { name = "Quark Cyber Systems", email = "vivek@quarkcs.com"}
 ]
-description = "SAP-style Moving Average and Standard Cost valuation kernels for ERPNext"
+description = "SAP-inspired Moving Average and Standard Cost valuation kernels for ERPNext"
 requires-python = ">=3.14"
 readme = "README.md"
 dynamic = ["version"]

@@ -1,7 +1,7 @@
 app_name = "sap_valuation"
 app_title = "SAP Valuation"
 app_publisher = "Quark Cyber Systems"
-app_description = "SAP-style Moving Average and Standard Cost valuation kernels for ERPNext"
+app_description = "SAP-inspired Moving Average and Standard Cost valuation kernels for ERPNext"
 app_email = "vivek@quarkcs.com"
 app_license = "gpl-3.0"
 
