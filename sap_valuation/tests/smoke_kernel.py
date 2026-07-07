@@ -9,7 +9,18 @@ verifies SME/IVE/IPB/SLE/GL identity.
 import frappe
 from frappe.utils import flt, nowdate
 
-COMPANY = "Badia Cement"
+def get_company():
+	"""Site's default company — keeps the suites client-agnostic."""
+	return (
+		frappe.defaults.get_global_default("company")
+		or frappe.get_all("Company", limit=1, pluck="name")[0]
+	)
+
+
+def __getattr__(name):
+	if name == "COMPANY":
+		return get_company()
+	raise AttributeError(name)
 ITEM = "_SMK-LIMESTONE"
 CHECKS = []
 
@@ -20,11 +31,11 @@ def check(label, ok, detail=""):
 
 
 def ensure_masters():
-	abbr = frappe.db.get_value("Company", COMPANY, "abbr")
+	abbr = frappe.db.get_value("Company", get_company(), "abbr")
 	wh_name = f"_SMK Stores - {abbr}"
 	if not frappe.db.exists("Warehouse", wh_name):
 		frappe.get_doc({
-			"doctype": "Warehouse", "warehouse_name": "_SMK Stores", "company": COMPANY,
+			"doctype": "Warehouse", "warehouse_name": "_SMK Stores", "company": get_company(),
 		}).insert(ignore_permissions=True)
 	if not frappe.db.exists("Item", ITEM):
 		frappe.get_doc({
@@ -45,7 +56,7 @@ def ensure_masters():
 			"territory": frappe.get_all("Territory", limit=1, pluck="name")[0],
 		}).insert(ignore_permissions=True)
 
-	if not frappe.db.exists("SAP Moving Average Settings", {"company": COMPANY}):
+	if not frappe.db.exists("SAP Moving Average Settings", {"company": get_company()}):
 		accounts = {}
 		for key, hint in [
 			("prd_account", "Cost of Goods Sold"),
@@ -57,26 +68,26 @@ def ensure_masters():
 		]:
 			acc = frappe.get_all(
 				"Account",
-				filters={"company": COMPANY, "is_group": 0, "account_name": ("like", f"%{hint}%")},
+				filters={"company": get_company(), "is_group": 0, "account_name": ("like", f"%{hint}%")},
 				limit=1, pluck="name",
 			) or frappe.get_all(
 				"Account",
-				filters={"company": COMPANY, "is_group": 0, "root_type": "Expense"},
+				filters={"company": get_company(), "is_group": 0, "root_type": "Expense"},
 				limit=1, pluck="name",
 			)
 			accounts[key] = acc[0]
 		frappe.get_doc({
-			"doctype": "SAP Moving Average Settings", "company": COMPANY,
+			"doctype": "SAP Moving Average Settings", "company": get_company(),
 			"negative_stock_allowed": 1, **accounts,
 		}).insert(ignore_permissions=True)
 
 	today = nowdate()
 	from frappe.utils import get_first_day
 	if not frappe.db.exists(
-		"Inventory Period", {"company": COMPANY, "status": "OPEN"}
+		"Inventory Period", {"company": get_company(), "status": "OPEN"}
 	):
 		frappe.get_doc({
-			"doctype": "Inventory Period", "company": COMPANY,
+			"doctype": "Inventory Period", "company": get_company(),
 			"start_date": get_first_day(today), "status": "OPEN",
 		}).insert(ignore_permissions=True)
 	return wh_name
@@ -86,7 +97,7 @@ def run(commit=False):
 	wh = ensure_masters()
 
 	pr = frappe.get_doc({
-		"doctype": "Purchase Receipt", "company": COMPANY, "supplier": "_SMK Supplier",
+		"doctype": "Purchase Receipt", "company": get_company(), "supplier": "_SMK Supplier",
 		"posting_date": nowdate(), "items": [{
 			"item_code": ITEM, "qty": 100, "rate": 10, "warehouse": wh,
 		}],
@@ -96,7 +107,7 @@ def run(commit=False):
 	check("PR submitted", pr.docstatus == 1)
 
 	ipb = frappe.get_all("Inventory Period Balance",
-		filters={"company": COMPANY, "item_code": ITEM},
+		filters={"company": get_company(), "item_code": ITEM},
 		fields=["*"], limit=1)[0]
 	check("IPB after receipt: qty 100", flt(ipb.closing_qty) == 100, str(ipb.closing_qty))
 	check("IPB after receipt: value 1000", flt(ipb.closing_value) == 1000, str(ipb.closing_value))
@@ -125,7 +136,7 @@ def run(commit=False):
 
 	# --- issue via Delivery Note: 30 units at MAP 10
 	dn = frappe.get_doc({
-		"doctype": "Delivery Note", "company": COMPANY, "customer": "_SMK Customer",
+		"doctype": "Delivery Note", "company": get_company(), "customer": "_SMK Customer",
 		"posting_date": nowdate(), "items": [{
 			"item_code": ITEM, "qty": 30, "rate": 25, "warehouse": wh,
 		}],
@@ -133,13 +144,13 @@ def run(commit=False):
 	dn.insert(ignore_permissions=True)
 	dn.submit()
 	ipb = frappe.get_all("Inventory Period Balance",
-		filters={"company": COMPANY, "item_code": ITEM}, fields=["*"], limit=1)[0]
+		filters={"company": get_company(), "item_code": ITEM}, fields=["*"], limit=1)[0]
 	check("IPB after issue: qty 70 value 700", flt(ipb.closing_qty) == 70 and flt(ipb.closing_value) == 700,
 		f"{ipb.closing_qty}/{ipb.closing_value}")
 
 	# --- second receipt 50 @ 20 -> MAP 14.166667
 	pr2 = frappe.get_doc({
-		"doctype": "Purchase Receipt", "company": COMPANY, "supplier": "_SMK Supplier",
+		"doctype": "Purchase Receipt", "company": get_company(), "supplier": "_SMK Supplier",
 		"posting_date": nowdate(), "items": [{
 			"item_code": ITEM, "qty": 50, "rate": 20, "warehouse": wh,
 		}],
@@ -147,7 +158,7 @@ def run(commit=False):
 	pr2.insert(ignore_permissions=True)
 	pr2.submit()
 	ipb = frappe.get_all("Inventory Period Balance",
-		filters={"company": COMPANY, "item_code": ITEM}, fields=["*"], limit=1)[0]
+		filters={"company": get_company(), "item_code": ITEM}, fields=["*"], limit=1)[0]
 	check("IPB qty 120 value 1700", flt(ipb.closing_qty) == 120 and flt(ipb.closing_value) == 1700,
 		f"{ipb.closing_qty}/{ipb.closing_value}")
 	check("MAP 14.1667", flt(ipb.moving_avg_price, 4) == 14.1667, str(ipb.moving_avg_price))
@@ -155,11 +166,11 @@ def run(commit=False):
 
 	# GL stock account net == inventory value
 	from sap_valuation.shared.accounts import get_inventory_account
-	inv_acc = get_inventory_account(COMPANY, ITEM, wh)
+	inv_acc = get_inventory_account(get_company(), ITEM, wh)
 	net = frappe.db.sql(
 		"""SELECT COALESCE(SUM(debit-credit),0) FROM `tabGL Entry`
 		WHERE company=%s AND account=%s AND is_cancelled=0 AND COALESCE(valuation_event_id,'') != ''""",
-		(COMPANY, inv_acc),
+		(get_company(), inv_acc),
 	)[0][0]
 	check("GL inventory net == IPB closing value", flt(net, 2) == flt(ipb.closing_value, 2),
 		f"gl {net} vs ipb {ipb.closing_value}")
