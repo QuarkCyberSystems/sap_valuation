@@ -318,6 +318,13 @@ def post_via_sap_ma_kernel(controller, sl_entries):
 		sl_entries, key=lambda s: (s.get("item_code"), s.get("warehouse") or "", str(s.get("posting_date")))
 	)
 
+	if controller.doctype == "Stock Reconciliation":
+		for sle in entries:
+			scope = ScopeState(company, sle.get("item_code"), sle.get("warehouse"))
+			period = assert_posting_allowed(company, sle.get("posting_date"))
+			_post_reconciliation(controller, scope, period, sle)
+		return
+
 	transfer_pairs, entries = _pair_transfers(controller, entries)
 	for out_sle, in_sle in transfer_pairs:
 		_post_transfer(controller, out_sle, in_sle)
@@ -332,6 +339,93 @@ def post_via_sap_ma_kernel(controller, sl_entries):
 			_post_current(controller, scope, period, sle, is_cancellation, is_return)
 		else:
 			_post_backdated(controller, scope, period, open_period, sle, is_return)
+
+
+def _post_reconciliation(controller, scope, period, sle):
+	"""Stock Reconciliation = the cutover / correction lever (signed plan).
+
+	SR rows carry ABSOLUTE targets (qty_after_transaction, valuation_rate),
+	not deltas. The kernel decomposes them into up to two immutable events:
+	a quantity adjustment at the target rate (count_gain / count_loss) and a
+	residual revaluation so closing value lands exactly on qty x rate.
+	Offset account: the reconciliation's expense/difference account.
+	"""
+	ipb = scope.load(period)
+	source = (controller.doctype, controller.name, sle.get("voucher_detail_no"))
+	posting_date = sle.get("posting_date")
+	map_before = flt(ipb.moving_avg_price)
+
+	current_qty = flt(ipb.closing_qty)
+	current_value = flt(ipb.closing_value)
+	target_qty = flt(sle.get("qty_after_transaction")) if sle.get("qty_after_transaction") is not None else current_qty
+	has_rate = sle.get("valuation_rate") not in (None, "")
+	rate = flt(sle.get("valuation_rate")) if has_rate else (map_before or 0)
+	target_value = r6(target_qty * rate) if has_rate else r6(current_value + (target_qty - current_qty) * rate)
+
+	qty_delta = r6(target_qty - current_qty)
+	offset = _reconciliation_offset_account(controller, sle)
+	inventory_account = get_inventory_account(scope.company, scope.item_code, scope.physical_warehouse)
+	total_delta = 0.0
+	last_ive = None
+
+	if qty_delta:
+		qty_value = r6(qty_delta * rate)
+		ipb.adjust_qty = r6(flt(ipb.adjust_qty) + qty_delta)
+		ipb.adjust_value = r6(flt(ipb.adjust_value) + qty_value)
+		recompute_closing(ipb)
+		sme, last_ive = write_events(
+			scope, ipb, source=source, posting_date=posting_date,
+			movement_type="count_gain" if qty_delta > 0 else "count_loss",
+			reason="count_diff", qty_delta=qty_delta, value_delta=qty_value,
+			map_before=map_before, affects_map=1 if has_rate else 0,
+			stock_uom=sle.get("stock_uom"),
+		)
+		post_gl(
+			controller, posting_date,
+			[(inventory_account, qty_value, offset), (offset, -qty_value, inventory_account)],
+			last_ive,
+		)
+		total_delta += qty_value
+
+	residual = r2(target_value - flt(ipb.closing_value))
+	if residual:
+		if flt(ipb.closing_qty) <= 0:
+			frappe.throw(
+				_("Row for {0}: cannot set a valuation rate on zero/negative stock.").format(scope.item_code)
+			)
+		ipb.reval_value = r6(flt(ipb.reval_value) + residual)
+		recompute_closing(ipb)
+		_, last_ive = write_events(
+			scope, ipb, source=source, posting_date=posting_date,
+			movement_type=None, reason="revaluation", qty_delta=0,
+			value_delta=residual, map_before=map_before, affects_map=1,
+		)
+		post_gl(
+			controller, posting_date,
+			[(inventory_account, residual, offset), (offset, -residual, inventory_account)],
+			last_ive,
+		)
+		total_delta += residual
+
+	if has_rate and flt(ipb.closing_qty) > 0:
+		ipb.moving_avg_price = rate
+	_freeze_check(ipb)
+	scope.save(ipb, caused_by=last_ive, source=source)
+
+	sle_row = dict(sle)
+	sle_row["actual_qty"] = qty_delta
+	write_sle(controller, sle_row, scope, ipb, total_delta)
+	maybe_rounding_cleanup(controller, scope, ipb, source, posting_date)
+
+
+def _reconciliation_offset_account(controller, sle):
+	detail = sle.get("voucher_detail_no")
+	for row in controller.get("items") or []:
+		if row.name == detail and row.get("expense_account"):
+			return row.get("expense_account")
+	return controller.get("expense_account") or frappe.get_cached_value(
+		"Company", controller.company, "stock_adjustment_account"
+	)
 
 
 def _pair_transfers(controller, entries):
@@ -623,11 +717,18 @@ def maybe_rounding_cleanup(controller, scope, ipb, source, posting_date):
 
 
 def _voucher_expense_account(controller, sle):
+	"""Expense/offset for issue-side GL: row override -> Item/Item Group
+	default expense -> Company default expense account. Never SRBNB."""
 	detail = sle.get("voucher_detail_no")
 	for row in controller.get("items") or []:
-		if row.name == detail:
+		if row.name == detail and row.get("expense_account"):
 			return row.get("expense_account")
-	return None
+	return (
+		get_offset_account(
+			controller.company, sle.get("item_code"), sle.get("warehouse"), "expense"
+		)
+		or frappe.get_cached_value("Company", controller.company, "default_expense_account")
+	)
 
 
 def _original_rate(controller, sle):

@@ -315,6 +315,91 @@ def run(commit=False):
 			"Not Eligible" in str(e) or "no longer be cancelled" in str(e), str(e)[:120])
 	frappe.db.set_value("Inventory Period", prior_period_name, "status", "PREV_OPEN_UNSETTLED")
 
+	# ============ GL AUDIT: Stock Reconciliation opening stock (client defect)
+	it = make_item("_SMK-RECO")
+	tsa = frappe.get_all("Account", filters={"company": COMPANY, "is_group": 0,
+		"account_type": "Temporary"}, limit=1, pluck="name")
+	opening_acct = tsa[0] if tsa else frappe.get_all("Account",
+		filters={"company": COMPANY, "is_group": 0, "root_type": "Liability"}, limit=1, pluck="name")[0]
+	sr = frappe.get_doc({
+		"doctype": "Stock Reconciliation", "company": COMPANY, "purpose": "Opening Stock",
+		"posting_date": nowdate(), "set_posting_time": 1, "expense_account": opening_acct,
+		"items": [{"item_code": it, "warehouse": wh, "qty": 500, "valuation_rate": 12}],
+	})
+	sr.insert(ignore_permissions=True)
+	sr.submit()
+	c = ipb(it)
+	check("SR opening: 500/6000 MAP 12",
+		flt(c.closing_qty) == 500 and flt(c.closing_value, 2) == 6000
+		and flt(c.moving_avg_price, 6) == 12,
+		f"{c.closing_qty}/{c.closing_value}/{c.moving_avg_price}")
+	gl = frappe.get_all("GL Entry", filters={"voucher_no": sr.name, "is_cancelled": 0},
+		fields=["account", "debit", "credit", "valuation_event_id"])
+	check("SR opening hits GL, fully tagged",
+		len(gl) == 2 and all(g.valuation_event_id for g in gl)
+		and flt(sum(g.debit for g in gl), 2) == 6000, str(gl))
+
+	# SR correction: qty down to 480 AND rate up to 12.50 in one row
+	sr2 = frappe.get_doc({
+		"doctype": "Stock Reconciliation", "company": COMPANY,
+		"purpose": "Stock Reconciliation",
+		"posting_date": nowdate(), "set_posting_time": 1,
+		"expense_account": frappe.get_cached_value("Company", COMPANY, "stock_adjustment_account"),
+		"items": [{"item_code": it, "warehouse": wh, "qty": 480, "valuation_rate": 12.5}],
+	})
+	sr2.insert(ignore_permissions=True)
+	sr2.submit()
+	c = ipb(it)
+	check("SR correction: 480/6000 MAP 12.5",
+		flt(c.closing_qty) == 480 and flt(c.closing_value, 2) == 6000
+		and flt(c.moving_avg_price, 4) == 12.5,
+		f"{c.closing_qty}/{c.closing_value}/{c.moving_avg_price}")
+	ives = frappe.get_all("Inventory Valuation Event",
+		filters={"source_docname": sr2.name}, fields=["reason_code", "value_delta"], order_by="name")
+	check("SR correction decomposed into count + reval",
+		sorted(i.reason_code for i in ives) == ["count_diff", "revaluation"], str(ives))
+
+	# ============ GL AUDIT: PI update_stock posts stock GL exactly once
+	it = make_item("_SMK-PIUS")
+	pi = frappe.get_doc({
+		"doctype": "Purchase Invoice", "company": COMPANY, "supplier": "_SMK Supplier",
+		"posting_date": nowdate(), "update_stock": 1,
+		"items": [{"item_code": it, "qty": 10, "rate": 15, "warehouse": wh}],
+	})
+	pi.insert(ignore_permissions=True)
+	pi.submit()
+	from sap_valuation.shared.accounts import get_inventory_account
+	inv_acct = get_inventory_account(COMPANY, it, wh)
+	stock_lines = frappe.get_all("GL Entry",
+		filters={"voucher_no": pi.name, "account": inv_acct, "is_cancelled": 0},
+		fields=["debit", "credit", "valuation_event_id"])
+	check("PI update_stock: exactly one tagged stock debit (no double post)",
+		len(stock_lines) == 1 and stock_lines[0].valuation_event_id
+		and flt(stock_lines[0].debit, 2) == 150, str(stock_lines))
+
+	# ============ GL AUDIT: DN issue expense never falls to SRBNB
+	it = make_item("_SMK-EXP")
+	make_pr(it, wh, 10, 10)
+	dn = make_dn(it, wh, 4)
+	srbnb = frappe.get_cached_value("Company", COMPANY, "stock_received_but_not_billed")
+	dn_gl = frappe.get_all("GL Entry", filters={"voucher_no": dn.name, "is_cancelled": 0},
+		fields=["account", "debit"])
+	check("DN issue debit is an expense account, not SRBNB",
+		dn_gl and all(g.account != srbnb for g in dn_gl), str(dn_gl))
+
+	# ============ batch/serial items cannot select the SAP method
+	try:
+		frappe.get_doc({
+			"doctype": "Item", "item_code": "_SMK-BATCH", "item_name": "x",
+			"item_group": frappe.get_all("Item Group", filters={"is_group": 0}, limit=1, pluck="name")[0],
+			"stock_uom": frappe.get_all("UOM", limit=1, pluck="name")[0],
+			"is_stock_item": 1, "has_batch_no": 1, "create_new_batch": 1,
+			"valuation_method": "SAP Moving Average",
+		}).insert(ignore_permissions=True)
+		check("batch item blocked from SAP method", False, "insert succeeded")
+	except frappe.ValidationError:
+		check("batch item blocked from SAP method", True)
+
 	failed = [x for x in CHECKS if not x[1]]
 	print(f"\n{len(CHECKS) - len(failed)}/{len(CHECKS)} checks passed")
 	if commit and not failed:
