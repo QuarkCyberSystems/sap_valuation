@@ -338,6 +338,33 @@ def run(commit=False):
 	check("P18c global GL == global period-balance value",
 		flt(total_ipb, 2) == gl_net, f"ipb {flt(total_ipb, 2)} gl {gl_net}")
 
+	# ---------- P20 manual-drift guard: JE blocked on kernel inventory accounts
+	from sap_valuation.overrides.journal_guard import CACHE_KEY
+	frappe.cache.delete_value(f"{CACHE_KEY}:{company}")
+	from sap_valuation.shared.accounts import get_inventory_account as _gia
+	protected_acct = _gia(company, "_PRD-2ROW", wh)
+	cogs = frappe.get_all("Account", filters={"company": company, "is_group": 0,
+		"root_type": "Expense"}, limit=1, pluck="name")[0]
+	cash = frappe.get_all("Account", filters={"company": company, "is_group": 0,
+		"account_type": "Cash"}, limit=1, pluck="name")[0]
+	try:
+		je = frappe.get_doc({"doctype": "Journal Entry", "company": company,
+			"posting_date": nowdate(), "accounts": [
+				{"account": protected_acct, "debit_in_account_currency": 100},
+				{"account": cash, "credit_in_account_currency": 100},
+			]})
+		je.insert(ignore_permissions=True)
+		check("P20a manual JE on kernel inventory account blocked", False, "inserted")
+	except frappe.ValidationError:
+		check("P20a manual JE on kernel inventory account blocked", True)
+	je2 = frappe.get_doc({"doctype": "Journal Entry", "company": company,
+		"posting_date": nowdate(), "accounts": [
+			{"account": cogs, "debit_in_account_currency": 50},
+			{"account": cash, "credit_in_account_currency": 50},
+		]})
+	je2.insert(ignore_permissions=True)
+	check("P20b JE on expense accounts still allowed", je2.name is not None)
+
 	# ---------- P19 double period close: activity close, then empty close
 	open_p = frappe.get_all("Inventory Period", filters={"company": company, "status": "OPEN"}, pluck="name")[0]
 	ipc1 = frappe.get_doc({"doctype": "Inventory Period Close", "company": company,
