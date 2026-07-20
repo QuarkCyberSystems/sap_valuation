@@ -10,7 +10,7 @@ class InventoryPeriodBalanceSnapshot(Document):
 	def before_insert(self):
 		kernel_only_insert(self)
 
-	def on_update(self):
+	def validate(self):
 		block_update(self)
 
 	def on_trash(self):

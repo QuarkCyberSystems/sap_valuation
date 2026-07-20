@@ -318,6 +318,8 @@ def post_via_sap_ma_kernel(controller, sl_entries):
 		sl_entries, key=lambda s: (s.get("item_code"), s.get("warehouse") or "", str(s.get("posting_date")))
 	)
 
+	_guard_rejected_qty(controller)
+
 	if controller.doctype == "Stock Reconciliation":
 		for sle in entries:
 			scope = ScopeState(company, sle.get("item_code"), sle.get("warehouse"))
@@ -341,6 +343,29 @@ def post_via_sap_ma_kernel(controller, sl_entries):
 			_post_backdated(controller, scope, period, open_period, sle, is_return)
 
 
+def _guard_rejected_qty(controller):
+	"""Rejected-warehouse receipts are unsupported for kernel items in this
+	release: a zero-rate rejected receipt entering a company-level scope would
+	dilute MAP. Quality-inspection stock is treated as regular stock (signed
+	plan scope declaration)."""
+	kernel_map = frappe.get_hooks("sap_valuation_kernels")
+	from erpnext.stock.utils import get_valuation_method
+
+	for row in controller.get("items") or []:
+		if (
+			flt(row.get("rejected_qty"))
+			and row.get("item_code")
+			and get_valuation_method(row.item_code, controller.get("company")) in kernel_map
+		):
+			frappe.throw(
+				_(
+					"Row {0}: rejected quantity is not supported for SAP-valuation item {1} in this "
+					"release. Receive the full quantity and post a return or count for rejects."
+				).format(row.idx, row.item_code),
+				title=_("Rejected Qty Not Supported"),
+			)
+
+
 def _post_reconciliation(controller, scope, period, sle):
 	"""Stock Reconciliation = the cutover / correction lever (signed plan).
 
@@ -360,7 +385,7 @@ def _post_reconciliation(controller, scope, period, sle):
 	target_qty = flt(sle.get("qty_after_transaction")) if sle.get("qty_after_transaction") is not None else current_qty
 	has_rate = sle.get("valuation_rate") not in (None, "")
 	rate = flt(sle.get("valuation_rate")) if has_rate else (map_before or 0)
-	target_value = r6(target_qty * rate) if has_rate else r6(current_value + (target_qty - current_qty) * rate)
+	target_value = r2(target_qty * rate) if has_rate else r2(current_value + (target_qty - current_qty) * rate)
 
 	qty_delta = r6(target_qty - current_qty)
 	offset = _reconciliation_offset_account(controller, sle)
@@ -369,7 +394,7 @@ def _post_reconciliation(controller, scope, period, sle):
 	last_ive = None
 
 	if qty_delta:
-		qty_value = r6(qty_delta * rate)
+		qty_value = r2(qty_delta * rate)
 		ipb.adjust_qty = r6(flt(ipb.adjust_qty) + qty_delta)
 		ipb.adjust_value = r6(flt(ipb.adjust_value) + qty_value)
 		recompute_closing(ipb)
@@ -490,7 +515,7 @@ def _post_transfer(controller, out_sle, in_sle):
 	ipb_in = in_scope.load(period)
 
 	rate = flt(ipb_out.frozen_map) if ipb_out.is_negative else flt(ipb_out.moving_avg_price)
-	value = r6(qty * rate)
+	value = r2(qty * rate)
 
 	map_before_out = flt(ipb_out.moving_avg_price)
 	ipb_out.issue_qty = r6(flt(ipb_out.issue_qty) + qty)
@@ -577,7 +602,7 @@ def _post_current(controller, scope, period, sle, is_cancellation, is_return):
 				_("Insufficient stock for {0}: negative stock is not allowed.").format(scope.item_code),
 				title=_("Negative Stock Blocked"),
 			)
-		issue_value = r6(-qty * rate)  # qty is negative
+		issue_value = r2(-qty * rate)  # qty is negative
 		ipb.issue_qty = r6(flt(ipb.issue_qty) - qty)
 		ipb.issue_value = r6(flt(ipb.issue_value) + issue_value)
 		recompute_closing(ipb)
@@ -601,7 +626,7 @@ def _post_current(controller, scope, period, sle, is_cancellation, is_return):
 			rate, reference_event = _original_rate(controller, sle)
 		else:
 			rate, reference_event = (flt(ipb.frozen_map) if ipb.is_negative else flt(ipb.moving_avg_price)), None
-		value = r6(qty * rate)  # signed with qty
+		value = r2(qty * rate)  # signed with qty
 		if qty > 0:
 			ipb.receipt_qty = r6(flt(ipb.receipt_qty) + qty)
 			ipb.receipt_value = r6(flt(ipb.receipt_value) + value)
@@ -635,7 +660,7 @@ def _post_current(controller, scope, period, sle, is_cancellation, is_return):
 
 def _apply_receipt(ipb, qty, rate):
 	"""Receipt math on the IPB row — mirrors reference kernel receipt()."""
-	receipt_value = r6(qty * rate)
+	receipt_value = r2(qty * rate)
 	closing = flt(ipb.closing_qty)
 
 	if closing >= 0:
@@ -647,8 +672,8 @@ def _apply_receipt(ipb, qty, rate):
 
 	frozen = flt(ipb.frozen_map)
 	if closing + qty <= 0:
-		prd = r6((rate - frozen) * qty)
-		net = r6(qty * frozen)
+		prd = r2((rate - frozen) * qty)
+		net = r2(qty * frozen)
 		ipb.receipt_qty = r6(flt(ipb.receipt_qty) + qty)
 		ipb.receipt_value = r6(flt(ipb.receipt_value) + receipt_value)
 		ipb.prd_value = r6(flt(ipb.prd_value) - prd)
@@ -658,8 +683,8 @@ def _apply_receipt(ipb, qty, rate):
 
 	clearing = r6(-closing)
 	excess = r6(qty - clearing)
-	prd = r6((rate - frozen) * clearing)
-	net = r6(clearing * frozen + excess * rate)
+	prd = r2((rate - frozen) * clearing)
+	net = r2(clearing * frozen + excess * rate)
 	ipb.receipt_qty = r6(flt(ipb.receipt_qty) + qty)
 	ipb.receipt_value = r6(flt(ipb.receipt_value) + receipt_value)
 	ipb.prd_value = r6(flt(ipb.prd_value) - prd)
@@ -870,7 +895,7 @@ def _post_backdated(controller, scope, prior_period, open_period, sle, is_return
 	if qty <= 0:
 		# backdated issue at the prior period's MAP
 		rate = flt(ipb_prior.frozen_map) if ipb_prior.is_negative else flt(ipb_prior.moving_avg_price)
-		issue_value = r6(-qty * rate)
+		issue_value = r2(-qty * rate)
 		ipb_prior.issue_qty = r6(flt(ipb_prior.issue_qty) - qty)
 		ipb_prior.issue_value = r6(flt(ipb_prior.issue_value) + issue_value)
 		recompute_closing(ipb_prior)
@@ -983,7 +1008,7 @@ def post_value_event(company, item_code, warehouse, *, source, posting_date, rea
 		ipb.reval_value = r6(flt(ipb.reval_value) + value_delta)
 	elif reason == "count_diff":
 		rate = flt(ipb.frozen_map) if ipb.is_negative else flt(ipb.moving_avg_price)
-		value_delta = r6(qty_delta * rate)
+		value_delta = r2(qty_delta * rate)
 		ipb.adjust_qty = r6(flt(ipb.adjust_qty) + qty_delta)
 		ipb.adjust_value = r6(flt(ipb.adjust_value) + value_delta)
 	elif reason in ("landed_cost", "invoice_diff", "fx_adjust"):

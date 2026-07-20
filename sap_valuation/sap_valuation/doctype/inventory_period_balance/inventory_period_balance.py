@@ -13,7 +13,19 @@ class InventoryPeriodBalance(Document):
 		kernel_only_insert(self)
 
 	def validate(self):
+		self.validate_kernel_only_mutation()
 		self.validate_unique_scope()
+
+	def validate_kernel_only_mutation(self):
+		# Runs BEFORE the database write — the block holds even when a caller
+		# catches the exception inside a larger transaction.
+		if self.is_new() or self.flags.in_insert:
+			return
+		if not frappe.flags.get(KERNEL_FLAG):
+			frappe.throw(
+				_("Inventory Period Balance is maintained by the posting kernel and cannot be edited manually."),
+				title=_("Immutable Ledger"),
+			)
 
 	def validate_unique_scope(self):
 		filters = {

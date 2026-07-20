@@ -24,7 +24,12 @@ def kernel_only_insert(doc, method=None):
 
 
 def block_update(doc, method=None):
-	"""on_update guard: no field of a persisted legal row may change."""
+	"""Immutability guard: no field of a persisted legal row may change.
+
+	MUST be called from validate() — it runs BEFORE the database write, so the
+	block holds even when the caller catches the exception inside a larger
+	transaction. (on_update fires after the write and is advisory only.)
+	"""
 	if doc.is_new() or doc.flags.in_insert:
 		return
 	if frappe.flags.get(KERNEL_FLAG) and getattr(doc, "_sap_allowed_update", False):
