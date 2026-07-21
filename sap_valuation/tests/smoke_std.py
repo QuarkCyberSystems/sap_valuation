@@ -224,6 +224,8 @@ def run(commit=False):
 	finally:
 		ITEM = orig_item
 
+	run_ytd(company)
+
 	failed = [x for x in CHECKS if not x[1]]
 	print(f"\n{len(CHECKS) - len(failed)}/{len(CHECKS)} checks passed")
 	if commit and not failed:
@@ -232,3 +234,132 @@ def run(commit=False):
 		frappe.db.rollback()
 	if failed:
 		raise Exception("STD conformance failures: " + "; ".join(x[0] for x in failed))
+
+
+YTD_ITEM = "_STD-YTD-LIME"
+
+# (ref, ent, pst, trans, qty, sc, ac, t_sc_override, t_ac_override) — verbatim
+# from badia_docs walkthrough_scenario.py (kernel-driven v4)
+E = None
+YTD_EVENTS = [
+	("", "2025-12-13", "2025-12-13", "Rec", 1000, 10, 12, E, E),
+	("", "2025-12-20", "2025-12-20", "Iss", 300, 10, E, E, E),
+	("", "2026-01-03", "2026-01-03", "Rec", 500, 10, 10, E, E),
+	("", "2026-01-08", "2026-01-08", "Iss", 100, 10, E, E, E),
+	("R1", "2026-01-09", "2026-01-09", "Rev Beg", E, 11, 10, 700, E),
+	("R1", "2026-01-09", "2026-01-09", "REV In", E, 11, 10, 500, E),
+	("R1", "2026-01-09", "2026-01-09", "REV out", E, 11, 10, -100, E),
+	("", "2026-01-09", "2025-12-29", "Issue (BY)", 20, 10, E, E, E),
+	("", "2026-01-09", "2026-01-09", "Issue (BY) - Rev", 20, 10, 11, -20, E),
+	("", "2026-01-09", "2025-12-30", "REC (BY)", 40, 10, 11, E, E),
+	("", "2026-01-09", "2026-01-09", "REC (BY) - Rev", 40, 10, 11, 40, E),
+	("", "2026-01-17", "2026-01-17", "SC+", 30, 11, E, E, E),
+	("", "2026-01-20", "2026-01-20", "PR", 80, 11, 12, E, E),
+	("", "2026-01-22", "2026-01-22", "SR", 40, 11, E, E, E),
+	("", "2026-01-24", "2026-01-24", "LC", E, E, 600, 0, 600),
+	("", "2026-01-30", "2026-01-30", "Iss", 15, 11, E, E, E),
+	("", "2026-02-03", "2026-02-03", "SC-", 10, 11, E, E, E),
+	("", "2026-02-05", "2026-02-05", "PR", 50, 11, 13, E, E),
+	("", "2026-02-07", "2026-02-07", "Rec", 80, 11, 14, E, E),
+	("", "2026-02-12", "2026-01-05", "Issue (BD)", 15, 11, E, E, E),
+	("", "2026-02-12", "2026-02-12", "Issue (BD) - Rev", 15, 11, 11, 0, E),
+	("", "2026-02-13", "2026-01-06", "REC (BD)", 20, 11, 12, E, E),
+	("", "2026-02-13", "2026-02-13", "REC (BD) - Rev", 20, 11, 11, 0, E),
+	("", "2026-02-18", "2026-01-20", "Iss", 25, 11, E, E, E),
+	("", "2026-02-22", "2026-02-22", "Rec", 40, 11, 9, E, E),
+	("R2", "2026-02-24", "2026-02-24", "Rev Beg", E, 13, 11, 1440, E),
+	("R2", "2026-02-24", "2026-02-24", "REV In", E, 13, 11, 1020, E),
+	("R2", "2026-02-24", "2026-02-24", "REV out", E, 13, 11, -190, E),
+	("", "2026-02-26", "2026-02-08", "Iss", 10, 13, E, E, E),
+	("", "2026-02-27", "2026-02-10", "Rec", 30, 13, 15, E, E),
+]
+
+# settlement actions interleaved by after-event index (0-based into YTD_EVENTS)
+YTD_SETTLEMENTS = [
+	{"after": 10, "action": "close", "year": 2025, "month": 12, "sc": 10,
+	 "ent": "2026-01-10", "ref": "DEC25"},
+	{"after": 22, "action": "close", "year": 2026, "month": 1, "sc": 11,
+	 "ent": "2026-02-15", "ref": "JAN26_orig"},
+	{"after": 22, "action": "reverse", "target": "JAN26_orig", "ent": "2026-02-18"},
+	{"after": 23, "action": "close", "year": 2026, "month": 1, "sc": 11,
+	 "ent": "2026-02-20", "ref": "JAN26_re"},
+	{"after": 29, "action": "close", "year": 2026, "month": 2, "sc": 13,
+	 "ent": "2026-03-02", "ref": "FEB26"},
+]
+
+
+def run_ytd(company):
+	"""Replay the 40-event kernel-driven YTD walkthrough; simulator anchors."""
+	from sap_valuation.sap_standard_cost.engine import StdEngine
+
+	if not frappe.db.exists("Item", YTD_ITEM):
+		frappe.get_doc({"doctype": "Item", "item_code": YTD_ITEM, "item_name": YTD_ITEM,
+			"item_group": frappe.get_all("Item Group", filters={"is_group": 0}, limit=1, pluck="name")[0],
+			"stock_uom": frappe.get_all("UOM", limit=1, pluck="name")[0],
+			"is_stock_item": 1, "valuation_method": "SAP Standard Cost",
+			"settlement_view": "YTD"}).insert(ignore_permissions=True)
+	global ITEM
+	orig = ITEM
+	ITEM = YTD_ITEM
+	try:
+		scv = make_scv(company, 2025, 12, 10)
+		scv.flags.via_release_flow = True
+		scv.status = "RELEASED"
+		scv.save(ignore_permissions=True)
+	finally:
+		ITEM = orig
+	src = ("Item Standard Cost Version", scv.name)
+
+	eng = StdEngine(company, YTD_ITEM)
+	check("YTD engine view", eng.view == "YTD", eng.view)
+
+	setts = {}
+	by_idx = {}
+	for a in YTD_SETTLEMENTS:
+		by_idx.setdefault(a["after"], []).append(a)
+
+	for idx, (ref, ent, pst, trans, qty, sc, ac, t_sc, t_ac) in enumerate(YTD_EVENTS):
+		kwargs = dict(trans=trans, posting_date=pst, entry_date=ent, ref=ref, source=src)
+		if qty is not None:
+			kwargs["qty"] = qty
+		if sc is not None:
+			kwargs["sc"] = sc
+		if ac is not None:
+			kwargs["ac"] = ac
+		if t_sc is not None:
+			kwargs["t_sc_override"] = t_sc
+		if t_ac is not None:
+			kwargs["t_ac_override"] = t_ac
+		eng.post(**kwargs)
+		for a in by_idx.get(idx, []):
+			if a["action"] == "close":
+				setts[a["ref"]] = eng.close_period(year=a["year"], month=a["month"],
+					sc=a["sc"], source=src, entry_date=a["ent"], ref=a["ref"])
+			else:
+				eng.sett_reverse(setts[a["target"]].name, source=src, entry_date=a["ent"])
+
+	anchors = [
+		("DEC25", 1412.31, 627.69),
+		("JAN26_orig", 694.43, 37.88),
+		("JAN26_re", 678.65, 53.66),
+		("FEB26", -1473.72, -133.97),
+	]
+	for ref, es, out in anchors:
+		s_ = frappe.get_doc("Inventory Period Settlement", setts[ref].name)
+		check(f"YTD {ref} {es}/{out}",
+			abs(flt(s_.es_var) - es) <= 0.01 and abs(flt(s_.out_var) - out) <= 0.01,
+			f"{s_.es_var}/{s_.out_var}")
+	cancelled = frappe.db.get_value("Inventory Period Settlement", setts["JAN26_orig"].name, "cancelled")
+	check("YTD JAN26_orig cancelled", cancelled == 1)
+
+	check("YTD Feb end qty 1155", flt(eng.end_qty_ytd(2026, 2)) == 1155,
+		eng.end_qty_ytd(2026, 2))
+
+	gl = frappe.db.sql(
+		"""SELECT SUM(g.debit) d, SUM(g.credit) c,
+			SUM(CASE WHEN g.debit < 0 OR g.credit < 0 THEN 1 ELSE 0 END) neg
+		FROM `tabGL Entry` g JOIN `tabInventory Valuation Event` ive ON ive.name = g.valuation_event_id
+		WHERE ive.item_code = %s AND g.is_cancelled = 0""", (YTD_ITEM,), as_dict=True)[0]
+	check("YTD trial balance nets to zero", abs(flt(gl.d) - flt(gl.c)) <= 0.01,
+		f"{gl.d} vs {gl.c}")
+	check("YTD no negative GL cells", not gl.neg, str(gl.neg))
