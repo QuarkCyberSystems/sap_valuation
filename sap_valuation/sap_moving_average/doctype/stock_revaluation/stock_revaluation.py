@@ -18,9 +18,17 @@ class StockRevaluation(Document):
 
 		total = 0.0
 		for row in self.items:
-			if get_valuation_method(row.item_code, self.company) not in SAP_VALUATION_METHODS:
+			method = get_valuation_method(row.item_code, self.company)
+			if method not in SAP_VALUATION_METHODS:
 				frappe.throw(
 					_("Row {0}: {1} is not a SAP-valuation item.").format(row.idx, row.item_code)
+				)
+			if method == "SAP Standard Cost":
+				frappe.throw(
+					_(
+						"Row {0}: standard costs change by releasing a new Item Standard Cost Version, "
+						"not by Stock Revaluation."
+					).format(row.idx)
 				)
 			self.set_current_state(row)
 			if flt(row.current_qty) <= 0:

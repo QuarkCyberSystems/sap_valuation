@@ -12,6 +12,7 @@ required_apps = ["erpnext"]
 # Phase 3 without further core edits.
 sap_valuation_kernels = {
 	"SAP Moving Average": "sap_valuation.sap_moving_average.kernel.post_via_sap_ma_kernel",
+	"SAP Standard Cost": "sap_valuation.sap_standard_cost.kernel.post_via_sap_std_kernel",
 }
 
 # Incoming-rate resolver for kernel-valued items (consulted by the fork's

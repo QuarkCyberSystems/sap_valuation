@@ -1,0 +1,610 @@
+# Copyright (c) 2026, Quark Cyber Systems
+# License: GNU General Public License v3. See license.txt
+
+"""SAP Standard Cost engine — Frappe port of the V2.03-conformant reference
+simulators (sap_std_mtd / sap_std_ytd). The event log lives in Inventory
+Valuation Event rows (STD columns); rollups are recomputed from the log
+exactly as the simulators do; settlements are frozen snapshots in Inventory
+Period Settlement.
+
+Behavioral contract (DR-05..DR-13):
+- receipts at SC with immediate PPV; issues at SC create no variance
+- landed cost and invoice differences post into the PPV pool (DR-05)
+- boundary revaluation = dated 3-leg triplet; Rev pool settles (DR-12/13)
+- Sett back-dated to the period's last day, Sett-Rev on next day 1;
+  same-FY full 4-leg reverse, cross-FY inventory-share only (DR-06)
+- MTD pools chain the prior live settlement's inventory share; YTD pools are
+  own-period + prior-Sett chain (full same-FY, inv-share cross-FY) (DR-07)
+- Sett-Reverse may only target the immediately-previous month (DR-08)
+- guard rails: PeriodLocked / BackdateLabel / RevalTSCDrift (DR-09)
+"""
+
+import calendar
+from datetime import date
+
+import frappe
+from frappe import _
+from frappe.utils import flt, getdate, now_datetime
+
+from sap_valuation.sap_standard_cost.config import BD_BY_PRIMARIES, SETT_FAMILY, flags_for
+from sap_valuation.shared.immutable import KERNEL_FLAG
+
+
+def r2(x):
+	return flt(x, 2)
+
+
+class PeriodLockedError(frappe.ValidationError):
+	pass
+
+
+class BackdateLabelError(frappe.ValidationError):
+	pass
+
+
+class RevalTSCDriftError(frappe.ValidationError):
+	pass
+
+
+class SettReverseRuleViolation(frappe.ValidationError):
+	pass
+
+
+def get_std_setting(company, key):
+	name = frappe.db.get_value("SAP Standard Cost Settings", {"company": company})
+	if not name:
+		frappe.throw(
+			_("SAP Standard Cost Settings not configured for company {0}.").format(company),
+			title=_("Missing Configuration"),
+		)
+	return frappe.db.get_value("SAP Standard Cost Settings", name, key)
+
+
+def get_settlement_view(company, item_code):
+	view = frappe.get_cached_value("Item", item_code, "settlement_view")
+	if view in ("MTD", "YTD"):
+		return view
+	item_group = frappe.get_cached_value("Item", item_code, "item_group")
+	group_view = frappe.db.get_value("Item Group", item_group, "default_settlement_view")
+	if group_view in ("MTD", "YTD"):
+		return group_view
+	return get_std_setting(company, "default_settlement_view") or "MTD"
+
+
+def get_active_standard_cost(company, item_code, warehouse, posting_date):
+	"""Timing Rule A/B: the RELEASED cost version effective at the posting date."""
+	d = getdate(posting_date)
+	include_wh = frappe.get_cached_value("Item", item_code, "valuation_includes_warehouse")
+	rows = frappe.get_all(
+		"Item Standard Cost Version",
+		filters={
+			"company": company,
+			"item_code": item_code,
+			"warehouse": ("in", ((warehouse or "") if include_wh else "", None)),
+			"status": "RELEASED",
+		},
+		fields=["name", "standard_cost", "valid_from_year", "valid_from_month", "released_on"],
+	)
+	candidates = [
+		x for x in rows
+		if (x.valid_from_year, x.valid_from_month) <= (d.year, d.month)
+	]
+	if not candidates:
+		frappe.throw(
+			_("No RELEASED Item Standard Cost Version covers {0} for {1}. Release one before posting.").format(
+				posting_date, item_code
+			),
+			title=_("No Standard Cost"),
+		)
+	best = max(candidates, key=lambda x: (x.valid_from_year, x.valid_from_month, x.released_on or ""))
+	return best
+
+
+class StdEngine:
+	"""Event-log engine for one valuation scope (company, item [, warehouse])."""
+
+	def __init__(self, company, item_code, warehouse=None):
+		self.company = company
+		self.item_code = item_code
+		self.include_warehouse = frappe.get_cached_value(
+			"Item", item_code, "valuation_includes_warehouse"
+		)
+		self.warehouse = (warehouse or "") if self.include_warehouse else ""
+		self.physical_warehouse = warehouse
+		self.view = get_settlement_view(company, item_code)
+
+	# ------------------------------------------------------------------ query
+	def _scope_filters(self):
+		filters = {"company": self.company, "item_code": self.item_code, "is_cancelled": 0}
+		if self.include_warehouse:
+			filters["warehouse"] = self.physical_warehouse
+		return filters
+
+	def events(self, extra=None):
+		filters = self._scope_filters()
+		filters["std_trans"] = ("!=", "")
+		if extra:
+			filters.update(extra)
+		return frappe.get_all(
+			"Inventory Valuation Event",
+			filters=filters,
+			fields=["name", "std_trans", "period_year", "period_month", "qty_adj",
+				"total_sc", "total_ac", "in_flag", "out_flag", "ppv_with_sett",
+				"ppv_without_sett", "rev_flag", "creation", "posting_date"],
+			order_by="creation asc",
+		)
+
+	def settlements(self, live_only=False):
+		filters = {
+			"company": self.company, "item_code": self.item_code,
+			"warehouse": self.warehouse or "",
+		}
+		if live_only:
+			filters["cancelled"] = 0
+		return frappe.get_all(
+			"Inventory Period Settlement",
+			filters=filters,
+			fields=["*"],
+			order_by="creation asc",
+		)
+
+	def is_period_locked(self, year, month):
+		"""A period is locked once a live settlement exists for it (DR-08)."""
+		return bool(
+			frappe.db.exists(
+				"Inventory Period Settlement",
+				{
+					"company": self.company, "item_code": self.item_code,
+					"warehouse": self.warehouse or "", "period_year": year,
+					"period_month": month, "cancelled": 0,
+				},
+			)
+		)
+
+	# ------------------------------------------------------------------ post
+	def post(self, *, trans, posting_date, qty=None, sc=None, ac=None, source,
+			entry_date=None, ref="", t_sc_override=None, t_ac_override=None,
+			cost_version=None, post_gl=True):
+		"""Append one STD event (and its GL unless Sett-family)."""
+		flags = flags_for(trans, self.view)
+		pst = getdate(posting_date)
+		ent = getdate(entry_date) if entry_date else getdate(frappe.utils.nowdate())
+
+		if trans not in SETT_FAMILY and self.is_period_locked(pst.year, pst.month):
+			raise PeriodLockedError(
+				_(
+					"Cannot post {0} dated {1}: period {2}-{3:02d} is settled. "
+					"Reverse the settlement first (previous month only) or post a forward correction."
+				).format(trans, posting_date, pst.year, pst.month)
+			)
+
+		if trans in BD_BY_PRIMARIES and (pst.month, pst.year) == (ent.month, ent.year):
+			raise BackdateLabelError(
+				_(
+					"{0} is only for cross-month backdates. Same-month backdates post as plain "
+					"Rec/Iss at the current standard cost with no companion."
+				).format(trans)
+			)
+
+		if trans.endswith("Rev") or trans.startswith("Rev") or trans.startswith("Sett") or qty is None:
+			qty_adj = 0.0
+		else:
+			qty_adj = flt(qty) if flags.mvt == "In" else (-flt(qty) if flags.mvt == "Out" else 0.0)
+
+		total_sc = t_sc_override if t_sc_override is not None else r2((sc or 0) * qty_adj)
+		total_ac = t_ac_override if t_ac_override is not None else r2((ac or 0) * qty_adj)
+
+		if trans in ("Rev Beg", "REV In", "REV out") and t_sc_override is not None \
+				and sc is not None and ac is not None:
+			expected_qty = self._reval_qty_at(trans, ent, sc_new=flt(sc), sc_old=flt(ac))
+			expected = abs(flt(sc) - flt(ac)) * expected_qty
+			if abs(abs(total_sc) - expected) > 0.01:
+				raise RevalTSCDriftError(
+					_("{0} amount {1} does not match |SC delta| x categorized qty = {2}.").format(
+						trans, abs(total_sc), r2(expected)
+					)
+				)
+
+		frappe.flags[KERNEL_FLAG] = True
+		try:
+			ive = frappe.get_doc({
+				"doctype": "Inventory Valuation Event",
+				"company": self.company,
+				"item_code": self.item_code,
+				"warehouse": self.physical_warehouse,
+				"period_year": pst.year,
+				"period_month": pst.month,
+				"posting_date": posting_date,
+				"entry_date": now_datetime(),
+				"source_doctype": source[0],
+				"source_docname": source[1],
+				"source_detail_name": source[2] if len(source) > 2 else None,
+				"reason_code": "settlement" if trans in SETT_FAMILY else "std_event",
+				"std_trans": trans,
+				"qty_adj": qty_adj,
+				"qty_basis": abs(qty_adj),
+				"standard_cost": sc,
+				"actual_cost": ac,
+				"total_sc": r2(total_sc),
+				"total_ac": r2(total_ac),
+				"value_delta": 0,  # inventory effect tracked via GL legs / IPB below
+				"in_flag": flags.in_flag,
+				"out_flag": flags.out_flag,
+				"ppv_with_sett": flags.ppvw,
+				"ppv_without_sett": flags.ppvwo,
+				"rev_flag": flags.rev,
+				"settlement_ref": str(ref) if ref else "",
+				"cost_version": cost_version,
+			}).insert(ignore_permissions=True)
+		finally:
+			frappe.flags[KERNEL_FLAG] = False
+
+		if post_gl and trans not in SETT_FAMILY:
+			self._post_gl(ive, trans, total_sc, total_ac)
+		return ive
+
+	# -------------------------------------------------------------- GL legs
+	def accounts(self):
+		from sap_valuation.shared.accounts import get_inventory_account
+
+		company = self.company
+		return frappe._dict(
+			stock=get_inventory_account(company, self.item_code, self.physical_warehouse),
+			ppv=get_std_setting(company, "ppv_account"),
+			reserve=get_std_setting(company, "std_reval_reserve_account"),
+			cogs_adj=get_std_setting(company, "cogs_adjustment_account"),
+			customer_cogs=get_std_setting(company, "customer_cogs_account")
+				or frappe.get_cached_value("Company", company, "default_expense_account"),
+			fy_carry=get_std_setting(company, "fy_carry_forward_account"),
+			cogs=frappe.get_cached_value("Company", company, "default_expense_account"),
+			grir=frappe.get_cached_value("Company", company, "stock_received_but_not_billed"),
+			stock_adj=frappe.get_cached_value("Company", company, "stock_adjustment_account"),
+		)
+
+	def _legs(self, trans, s, u, a, settlement=None, offset_override=None):
+		"""Port of gl_legs_for_event: [(account, signed_amount)] (+Dr / -Cr)."""
+		if trans == "Beg":
+			return [(a.stock, s), (a.ppv, u - s), (a.fy_carry, -u)]
+		if trans in ("Rec", "REC (BD)", "REC (BY)"):
+			return [(a.stock, s), (a.ppv, u - s), (offset_override or a.grir, -u)]
+		if trans in ("Iss", "Issue (BD)", "Issue (BY)"):
+			return [(offset_override or a.cogs, -s), (a.stock, s)]
+		if trans == "PR":
+			# reverses the original receipt's PPV: u,s are negative on returns
+			return [(a.stock, s), (a.ppv, u - s), (offset_override or a.grir, -u)]
+		if trans == "SR":
+			return [(a.stock, s), (a.customer_cogs, -s)]
+		if trans == "LC":
+			return [(a.ppv, u), (offset_override or a.grir, -u)]
+		if trans == "SC+":
+			return [(a.stock, s), (offset_override or a.stock_adj, -s)]
+		if trans == "SC-":
+			return [(offset_override or a.stock_adj, -s), (a.stock, s)]
+		if trans in ("Rev Beg", "REV In", "REC (BD) - Rev", "REC (BY) - Rev"):
+			return [(a.stock, s), (a.reserve, -s)]
+		if trans == "REV out":
+			# t_sc convention: -(delta x out_qty). SC increase (delta>0) -> s<0 ->
+			# Dr COGS Adjustment / Cr Stock; SC decrease flips both legs.
+			return [(a.cogs_adj, -s), (a.stock, s)]
+		if trans in ("Issue (BD) - Rev", "Issue (BY) - Rev"):
+			return [(a.cogs_adj, -s), (a.reserve, s)]
+		if settlement is not None:
+			es, out = flt(settlement.es_var), flt(settlement.out_var)
+			ppv, rev = flt(settlement.ppv_pool), flt(settlement.rev_pool)
+			ppv_es, rev_es = flt(settlement.ppv_es), flt(settlement.rev_es)
+			xfy = settlement.period_month == 12
+			if trans == "Sett":
+				return [(a.stock, es), (a.cogs_adj, out), (a.ppv, -ppv), (a.reserve, -rev)]
+			if trans == "Sett - Rev":
+				if xfy:
+					return [(a.stock, -es), (a.ppv, ppv_es), (a.reserve, rev_es)]
+				return [(a.stock, -es), (a.cogs_adj, -out), (a.ppv, ppv), (a.reserve, rev)]
+			if trans == "Sett - Reverse":
+				return [(a.stock, -es), (a.cogs_adj, -out), (a.ppv, ppv), (a.reserve, rev)]
+			if trans == "Sett - Rev - Reverse":
+				if xfy:
+					return [(a.stock, es), (a.ppv, -ppv_es), (a.reserve, -rev_es)]
+				return [(a.stock, es), (a.cogs_adj, out), (a.ppv, -ppv), (a.reserve, -rev)]
+		return []
+
+	def _post_gl(self, ive, trans, total_sc, total_ac, settlement=None, offset_override=None,
+			posting_date=None):
+		from erpnext.accounts.general_ledger import make_gl_entries
+
+		a = self.accounts()
+		legs = self._legs(trans, flt(total_sc), flt(total_ac), a, settlement, offset_override)
+		gl_map = []
+		cost_center = frappe.get_cached_value("Company", self.company, "cost_center")
+		for account, amount in legs:
+			amount = r2(amount)
+			if not amount or not account:
+				continue
+			gl_map.append(frappe._dict({
+				"account": account,
+				"against": a.stock if account != a.stock else a.ppv,
+				"debit": amount if amount > 0 else 0,
+				"credit": -amount if amount < 0 else 0,
+				"debit_in_account_currency": amount if amount > 0 else 0,
+				"credit_in_account_currency": -amount if amount < 0 else 0,
+				"posting_date": posting_date or ive.posting_date,
+				"voucher_type": ive.source_doctype,
+				"voucher_no": ive.source_docname,
+				"company": self.company,
+				"cost_center": cost_center,
+				"remarks": _("SAP STD event {0} ({1})").format(ive.name, trans),
+				"valuation_event_id": ive.name,
+			}))
+		if gl_map:
+			make_gl_entries(gl_map, merge_entries=False)
+
+	# ------------------------------------------------------------- rollups
+	def _sum(self, expr, cond, params):
+		wh_cond = " AND warehouse = %(warehouse)s" if self.include_warehouse else ""
+		params = dict(params, company=self.company, item_code=self.item_code,
+			warehouse=self.physical_warehouse)
+		return flt(frappe.db.sql(
+			f"""SELECT COALESCE(SUM({expr}), 0) FROM `tabInventory Valuation Event`
+			WHERE company = %(company)s AND item_code = %(item_code)s AND is_cancelled = 0
+				AND COALESCE(std_trans, '') != ''{wh_cond} AND {cond}""",
+			params,
+		)[0][0], 6)
+
+	def _periods_present(self):
+		wh_cond = " AND warehouse = %(warehouse)s" if self.include_warehouse else ""
+		rows = frappe.db.sql(
+			f"""SELECT DISTINCT period_year, period_month FROM `tabInventory Valuation Event`
+			WHERE company = %(company)s AND item_code = %(item_code)s AND is_cancelled = 0
+				AND COALESCE(std_trans, '') != ''{wh_cond}""",
+			{"company": self.company, "item_code": self.item_code,
+			 "warehouse": self.physical_warehouse},
+		)
+		return sorted((int(y), int(m)) for y, m in rows)
+
+	# ---- MTD rollups (month-scoped, Beg chains from prior period's End)
+	def beg_qty_mtd(self, year, month):
+		prior = [p for p in self._periods_present() if p < (year, month)]
+		if not prior:
+			return 0.0
+		py, pm = prior[-1]
+		return self.end_qty_mtd(py, pm)
+
+	def end_qty_mtd(self, year, month):
+		return self.beg_qty_mtd(year, month) + self._sum(
+			"qty_adj", "period_year = %(y)s AND period_month = %(m)s", {"y": year, "m": month}
+		)
+
+	def in_qty_mtd(self, year, month, before=None):
+		cond = "period_year = %(y)s AND period_month = %(m)s AND in_flag = 1"
+		if before:
+			cond += " AND creation < %(before)s"
+		return self._sum("qty_adj", cond, {"y": year, "m": month, "before": before})
+
+	def out_qty_mtd(self, year, month, before=None):
+		cond = "period_year = %(y)s AND period_month = %(m)s AND out_flag = 1"
+		if before:
+			cond += " AND creation < %(before)s"
+		return self._sum("qty_adj", cond, {"y": year, "m": month, "before": before})
+
+	def own_ppv(self, year, month, before=None):
+		cond = "period_year = %(y)s AND period_month = %(m)s AND ppv_without_sett = 1"
+		if before:
+			cond += " AND creation < %(before)s"
+		return self._sum("total_ac - total_sc", cond, {"y": year, "m": month, "before": before})
+
+	def own_rev(self, year, month, before=None):
+		cond = "period_year = %(y)s AND period_month = %(m)s AND rev_flag = 1"
+		if before:
+			cond += " AND creation < %(before)s"
+		return self._sum("total_ac - total_sc", cond, {"y": year, "m": month, "before": before})
+
+	# ---- YTD rollups (FY-cumulative)
+	def _beg_events(self, year):
+		return self.events({"std_trans": "Beg", "period_year": year})
+
+	def _last_live_settlement_in_year(self, year):
+		rows = [s for s in self.settlements(live_only=True) if s.period_year == year]
+		return max(rows, key=lambda s: s.period_month) if rows else None
+
+	def beg_qty_ytd(self, year):
+		beg = sum(flt(e.qty_adj) for e in self._beg_events(year))
+		if beg:
+			return beg
+		prior = self._last_live_settlement_in_year(year - 1)
+		return flt(prior.es_qty) if prior else 0.0
+
+	def beg_value_ytd(self, year):
+		beg = sum(flt(e.total_sc) for e in self._beg_events(year))
+		if beg:
+			return beg
+		prior = self._last_live_settlement_in_year(year - 1)
+		if not prior:
+			return 0.0
+		return flt(prior.beg_value_sc) + flt(prior.in_value_sc) + flt(prior.ppv_es) + flt(prior.rev_es)
+
+	def in_qty_ytd(self, year, month, before=None):
+		cond = "period_year = %(y)s AND period_month <= %(m)s AND in_flag = 1"
+		if before:
+			cond += " AND creation < %(before)s"
+		return self._sum("qty_adj", cond, {"y": year, "m": month, "before": before})
+
+	def in_value_ytd(self, year, month, before=None):
+		cond = "period_year = %(y)s AND period_month <= %(m)s AND in_flag = 1"
+		if before:
+			cond += " AND creation < %(before)s"
+		return self._sum("total_sc", cond, {"y": year, "m": month, "before": before})
+
+	def out_qty_ytd(self, year, month, before=None):
+		cond = "period_year = %(y)s AND period_month <= %(m)s AND out_flag = 1"
+		if before:
+			cond += " AND creation < %(before)s"
+		return self._sum("qty_adj", cond, {"y": year, "m": month, "before": before})
+
+	def end_qty_ytd(self, year, month, before=None):
+		cond = "period_year = %(y)s AND period_month <= %(m)s"
+		if before:
+			cond += " AND creation < %(before)s"
+		own = self._sum("qty_adj", cond, {"y": year, "m": month, "before": before})
+		if self._beg_events(year):
+			return own
+		prior = self._last_live_settlement_in_year(year - 1)
+		return own + (flt(prior.es_qty) if prior else 0.0)
+
+	def _prior_live_settlement(self, year, month):
+		ty, tm = (year, month - 1) if month > 1 else (year - 1, 12)
+		rows = [s for s in self.settlements(live_only=True)
+			if s.period_year == ty and s.period_month == tm]
+		return rows[-1] if rows else None
+
+	def pool_ppv(self, year, month, before=None):
+		if self.view == "MTD":
+			own = self.own_ppv(year, month, before)
+			prior = self._prior_live_settlement_mtd(year, month)
+			return own + (flt(prior.ppv_es) if prior else 0.0)
+		own = self.own_ppv(year, month, before)
+		prior = self._prior_live_settlement(year, month)
+		if not prior:
+			return own
+		return own + (flt(prior.ppv_pool) if prior.period_year == year else flt(prior.ppv_es))
+
+	def pool_rev(self, year, month, before=None):
+		if self.view == "MTD":
+			own = self.own_rev(year, month, before)
+			prior = self._prior_live_settlement_mtd(year, month)
+			return own + (flt(prior.rev_es) if prior else 0.0)
+		own = self.own_rev(year, month, before)
+		prior = self._prior_live_settlement(year, month)
+		if not prior:
+			return own
+		return own + (flt(prior.rev_pool) if prior.period_year == year else flt(prior.rev_es))
+
+	def _prior_live_settlement_mtd(self, year, month):
+		rows = [s for s in self.settlements(live_only=True)
+			if (s.period_year, s.period_month) < (year, month)]
+		return max(rows, key=lambda s: (s.period_year, s.period_month, s.creation)) if rows else None
+
+	# ---- reval qty categorization (drift guard, client-verified)
+	def _reval_qty_at(self, trans, ent, *, sc_new, sc_old):
+		year = ent.year
+		beg_events = [e for e in self._beg_events(year) if getdate(e.posting_date) <= ent]
+		if beg_events:
+			beg = sum(flt(e.qty_adj) for e in beg_events)
+		else:
+			beg = self._sum("qty_adj", "period_year < %(y)s", {"y": year})
+		in_qty = out_qty = 0.0
+		for e in self.events({"period_year": year}):
+			if getdate(e.posting_date) >= ent or not flt(e.qty_adj):
+				continue
+			if e.std_trans in ("Rec", "REC (BD)", "REC (BY)", "PR"):
+				in_qty += flt(e.qty_adj)
+			elif e.std_trans in ("Iss", "Issue (BD)", "Issue (BY)", "SC-"):
+				out_qty += -flt(e.qty_adj)
+			elif e.std_trans in ("SR", "SC+"):
+				out_qty += -flt(e.qty_adj)
+		return {"Rev Beg": beg, "REV In": in_qty, "REV out": out_qty}.get(trans, 0.0)
+
+	# --------------------------------------------------------- close period
+	def close_period(self, *, year, month, sc, source, entry_date=None, ref=None,
+			es_qty_override=None, out_qty_override=None, settlement_run=None):
+		before = now_datetime()
+		if self.view == "MTD":
+			beg_qty = self.beg_qty_mtd(year, month)
+			in_qty = self.in_qty_mtd(year, month)
+			beg_value = r2(sc * beg_qty)
+			in_value = r2(sc * in_qty)
+			end_qty = self.end_qty_mtd(year, month)
+			out_qty = -self.out_qty_mtd(year, month)
+		else:
+			beg_qty = self.beg_qty_ytd(year)
+			in_qty = self.in_qty_ytd(year, month)
+			beg_value = r2(self.beg_value_ytd(year))
+			in_value = r2(self.in_value_ytd(year, month))
+			end_qty = self.end_qty_ytd(year, month)
+			out_qty = -self.out_qty_ytd(year, month)
+
+		ppv = self.pool_ppv(year, month)
+		rev = self.pool_rev(year, month)
+		var = ppv + rev
+		if es_qty_override is not None:
+			end_qty = es_qty_override
+		if out_qty_override is not None:
+			out_qty = out_qty_override
+		denom = beg_qty + in_qty
+		es_var = r2(var * end_qty / denom) if denom else 0.0
+		out_var = r2(var * out_qty / denom) if denom else 0.0
+		share = (end_qty / denom) if denom else 0.0
+		cons_share = (out_qty / denom) if denom else 0.0
+
+		frappe.flags[KERNEL_FLAG] = True
+		try:
+			sett = frappe.get_doc({
+				"doctype": "Inventory Period Settlement",
+				"company": self.company, "item_code": self.item_code,
+				"warehouse": self.warehouse or "",
+				"period_year": year, "period_month": month,
+				"settlement_view": self.view, "settlement_run": settlement_run,
+				"beg_qty": beg_qty, "beg_value_sc": beg_value, "standard_cost": sc,
+				"in_qty": in_qty, "in_value_sc": in_value,
+				"ppv_pool": r2(ppv), "rev_pool": r2(rev),
+				"total_ac": r2(beg_value + in_value + ppv + rev), "variance": r2(var),
+				"es_qty": end_qty, "es_var": es_var,
+				"ppv_es": r2(ppv * share), "rev_es": r2(rev * share),
+				"out_qty": out_qty, "out_var": out_var,
+				"ppv_cons": r2(ppv * cons_share), "rev_cons": r2(rev * cons_share),
+				"es_qty_override": es_qty_override,
+			}).insert(ignore_permissions=True)
+		finally:
+			frappe.flags[KERNEL_FLAG] = False
+
+		last_day = date(year, month, calendar.monthrange(year, month)[1])
+		next_day = date(year + 1, 1, 1) if month == 12 else date(year, month + 1, 1)
+		ref_str = ref or sett.name
+
+		sett_event = self.post(trans="Sett", posting_date=last_day, source=source,
+			entry_date=entry_date, ref=ref_str, t_sc_override=es_var, post_gl=False)
+		self._post_gl(sett_event, "Sett", es_var, 0, settlement=sett, posting_date=last_day)
+		sett_rev_event = self.post(trans="Sett - Rev", posting_date=next_day, source=source,
+			entry_date=entry_date, ref=ref_str, t_sc_override=-es_var, post_gl=False)
+		self._post_gl(sett_rev_event, "Sett - Rev", -es_var, 0, settlement=sett,
+			posting_date=next_day)
+
+		frappe.db.set_value("Inventory Period Settlement", sett.name,
+			{"sett_event": sett_event.name, "sett_rev_event": sett_rev_event.name},
+			update_modified=False)
+		return frappe.get_doc("Inventory Period Settlement", sett.name)
+
+	# --------------------------------------------------------- sett reverse
+	def sett_reverse(self, settlement_name, *, source, entry_date=None):
+		sett = frappe.get_doc("Inventory Period Settlement", settlement_name)
+		if sett.cancelled:
+			frappe.throw(_("{0} is already cancelled.").format(settlement_name))
+		ent = getdate(entry_date) if entry_date else getdate(frappe.utils.nowdate())
+		ty, tm = sett.period_year, sett.period_month
+		prev_ok = (ty == ent.year and tm == ent.month - 1) or (
+			ty == ent.year - 1 and tm == 12 and ent.month == 1
+		)
+		if not prev_ok:
+			raise SettReverseRuleViolation(
+				_(
+					"Sett-Reverse may only target the immediately-previous month "
+					"(today {0}-{1:02d}, target {2}-{3:02d})."
+				).format(ent.year, ent.month, ty, tm)
+			)
+
+		last_day = date(ty, tm, calendar.monthrange(ty, tm)[1])
+		next_day = date(ty + 1, 1, 1) if tm == 12 else date(ty, tm + 1, 1)
+
+		reverse_event = self.post(trans="Sett - Reverse", posting_date=last_day, source=source,
+			entry_date=entry_date, ref=sett.name, t_sc_override=-flt(sett.es_var), post_gl=False)
+		self._post_gl(reverse_event, "Sett - Reverse", 0, 0, settlement=sett,
+			posting_date=last_day)
+		rev_reverse_event = self.post(trans="Sett - Rev - Reverse", posting_date=next_day,
+			source=source, entry_date=entry_date, ref=sett.name,
+			t_sc_override=flt(sett.es_var), post_gl=False)
+		self._post_gl(rev_reverse_event, "Sett - Rev - Reverse", 0, 0, settlement=sett,
+			posting_date=next_day)
+
+		frappe.db.set_value("Inventory Period Settlement", sett.name, {
+			"cancelled": 1,
+			"reversed_by_events": f"{reverse_event.name},{rev_reverse_event.name}",
+		}, update_modified=False)
+		return reverse_event, rev_reverse_event

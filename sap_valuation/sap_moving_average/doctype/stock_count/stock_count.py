@@ -48,10 +48,15 @@ class StockCount(Document):
 		) if ipb else 0
 
 	def on_submit(self):
+		from erpnext.stock.utils import get_valuation_method
+
 		from sap_valuation.sap_moving_average.kernel import post_value_event
 
 		for row in self.items:
 			if not flt(row.quantity_difference):
+				continue
+			if get_valuation_method(row.item_code, self.company) == "SAP Standard Cost":
+				self.post_std_count(row)
 				continue
 			account = row.variance_account or get_offset_account(
 				self.company, row.item_code, row.warehouse, "count_diff"
@@ -80,4 +85,16 @@ class StockCount(Document):
 				"Post a corrective count instead."
 			),
 			title=_("Immutable Ledger"),
+		)
+
+	def post_std_count(self, row):
+		from sap_valuation.sap_standard_cost.engine import StdEngine, get_active_standard_cost
+
+		engine = StdEngine(self.company, row.item_code, row.warehouse)
+		scv = get_active_standard_cost(self.company, row.item_code, row.warehouse, self.posting_date)
+		qty = abs(flt(row.quantity_difference))
+		engine.post(
+			trans="SC+" if flt(row.quantity_difference) > 0 else "SC-",
+			posting_date=self.posting_date, qty=qty, sc=flt(scv.standard_cost),
+			source=(self.doctype, self.name, row.name), cost_version=scv.name,
 		)

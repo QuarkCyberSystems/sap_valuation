@@ -11,6 +11,7 @@ Phase 3) plug in without further core edits.
 """
 
 import frappe
+from frappe.utils import flt
 
 # Enum values added to Item.valuation_method by the fork. "SAP Standard Cost"
 # deliberately differs from core develop's "Standard Cost" (PR 56570), whose
@@ -49,6 +50,14 @@ def get_incoming_rate(args, valuation_method):
 	company = args.get("company")
 	if not company and args.get("warehouse"):
 		company = frappe.get_cached_value("Warehouse", args.get("warehouse"), "company")
+
+	if valuation_method == "SAP Standard Cost":
+		from sap_valuation.sap_standard_cost.engine import get_active_standard_cost
+
+		scv = get_active_standard_cost(
+			company, item_code, args.get("warehouse"), args.get("posting_date")
+		)
+		return flt(scv.standard_cost)
 
 	if valuation_method != "SAP Moving Average":
 		frappe.throw(

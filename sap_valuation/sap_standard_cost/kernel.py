@@ -1,0 +1,233 @@
+# Copyright (c) 2026, Quark Cyber Systems
+# License: GNU General Public License v3. See license.txt
+
+"""SAP Standard Cost posting kernel — voucher routing layer.
+
+Maps routed vouchers onto STD posting intents, drives StdEngine for the
+event log + GL, and maintains the SLE-compatible rows / Bin / Inventory
+Period Balance so reports and the reconciliation gate keep working (DR-02).
+
+Intent classification:
+- Purchase Receipt            -> Rec           (is_return -> PR)
+- Delivery Note / SI stock    -> Iss           (is_return -> SR)
+- Stock Entry receipt/issue   -> Rec / Iss     (transfers unsupported in v1)
+- backdated cross-month       -> REC (BD) / Issue (BD) + companion (Rule B)
+- backdated cross-FY          -> REC (BY) / Issue (BY) + companion
+- Landed Cost Voucher         -> LC            (via the shared LCV hook)
+- Purchase Invoice difference -> LC-shaped PPV event
+- Stock Count                 -> SC+ / SC-
+"""
+
+import frappe
+from frappe import _
+from frappe.utils import flt, getdate
+
+from sap_valuation.sap_standard_cost.engine import (
+	StdEngine,
+	get_active_standard_cost,
+	get_std_setting,
+	r2,
+)
+from sap_valuation.shared.immutable import KERNEL_FLAG
+from sap_valuation.shared.periods import assert_posting_allowed
+
+
+def post_via_sap_std_kernel(controller, sl_entries):
+	if controller.docstatus == 2:
+		frappe.throw(
+			_("Direct cancellation is blocked for SAP Standard Cost items. Use Create Cancellation."),
+			title=_("Immutable Ledger"),
+		)
+	if controller.doctype == "Subcontracting Receipt":
+		frappe.throw(
+			_("Subcontracting is not supported for SAP Standard Cost items in this release."),
+			title=_("Not Supported"),
+		)
+	if controller.doctype == "Stock Reconciliation":
+		frappe.throw(
+			_(
+				"Stock Reconciliation is not yet enabled for SAP Standard Cost items. "
+				"Use Stock Count (quantity) or release a new cost version (value)."
+			),
+			title=_("Not Supported"),
+		)
+
+	is_return = bool(controller.get("is_return"))
+	is_cancellation = bool(controller.get("is_cancellation"))
+	if is_cancellation:
+		frappe.throw(
+			_("Cancellation documents for SAP Standard Cost items arrive in Phase 4 (exact reversal with reference)."),
+			title=_("Not Supported Yet"),
+		)
+
+	entries = sorted(
+		sl_entries,
+		key=lambda s: (s.get("item_code"), s.get("warehouse") or "", str(s.get("posting_date"))),
+	)
+	for sle in entries:
+		if controller.doctype == "Stock Entry":
+			row = next(
+				(x for x in controller.get("items") or [] if x.name == sle.get("voucher_detail_no")),
+				None,
+			)
+			if row is not None and row.get("s_warehouse") and row.get("t_warehouse"):
+				frappe.throw(
+					_("Warehouse transfers are not supported for SAP Standard Cost items in this release."),
+					title=_("Not Supported"),
+				)
+		_post_entry(controller, sle, is_return)
+
+
+def _post_entry(controller, sle, is_return):
+	company = controller.company
+	item_code = sle.get("item_code")
+	posting_date = getdate(sle.get("posting_date"))
+	period = assert_posting_allowed(company, posting_date)
+	engine = StdEngine(company, item_code, sle.get("warehouse"))
+
+	today = getdate(frappe.utils.nowdate())
+	cross_month = (posting_date.year, posting_date.month) != (today.year, today.month)
+	cross_fy = posting_date.year != today.year
+
+	scv = get_active_standard_cost(company, item_code, sle.get("warehouse"), posting_date)
+	sc = flt(scv.standard_cost)
+	qty = flt(sle.get("actual_qty"))
+	source = (controller.doctype, controller.name, sle.get("voucher_detail_no"))
+
+	if qty > 0 and not is_return:
+		trans = "REC (BY)" if (cross_month and cross_fy) else ("REC (BD)" if cross_month else "Rec")
+		ac = flt(sle.get("incoming_rate"))
+		engine.post(trans=trans, posting_date=posting_date, qty=qty, sc=sc, ac=ac,
+			source=source, cost_version=scv.name)
+		value = r2(qty * sc)
+		_post_companion_if_needed(engine, controller, sle, trans, qty, sc, source, today)
+	elif qty < 0 and not is_return:
+		if flt(get_std_setting(company, "block_negative_stock_std") or 1):
+			_assert_stock_available(engine, -qty)
+		trans = "Issue (BY)" if (cross_month and cross_fy) else ("Issue (BD)" if cross_month else "Iss")
+		engine.post(trans=trans, posting_date=posting_date, qty=-qty, sc=sc,
+			source=source, cost_version=scv.name)
+		value = r2(qty * sc)
+		_post_companion_if_needed(engine, controller, sle, trans, -qty, sc, source, today)
+	elif is_return and qty < 0:
+		# purchase return (PR intent): at the ORIGINAL receipt's standard cost
+		ac = flt(sle.get("incoming_rate"))
+		engine.post(trans="PR", posting_date=posting_date, qty=-qty, sc=sc, ac=ac,
+			source=source, cost_version=scv.name)
+		value = r2(qty * sc)
+	else:
+		# sales return (SR intent): new movement at posting-date STD (phase-1 rule)
+		engine.post(trans="SR", posting_date=posting_date, qty=qty, sc=sc,
+			source=source, cost_version=scv.name)
+		value = r2(qty * sc)
+
+	_write_sle_and_state(controller, engine, sle, period, qty, sc, value)
+
+
+def _post_companion_if_needed(engine, controller, sle, trans, qty, sc_original, source, today):
+	"""Cross-month/FY backdate companion: bridges qty x (current SC - original SC)
+	in the current period (audit-only when the SC is unchanged)."""
+	if trans not in ("REC (BD)", "Issue (BD)", "REC (BY)", "Issue (BY)"):
+		return
+	current = get_active_standard_cost(
+		engine.company, engine.item_code, engine.physical_warehouse, today
+	)
+	delta = flt(current.standard_cost) - flt(sc_original)
+	companion_value = r2(qty * delta)
+	if trans.startswith("Issue"):
+		companion_value = -companion_value
+	if not companion_value:
+		return
+	engine.post(
+		trans=f"{trans} - Rev", posting_date=today, qty=qty,
+		sc=current.standard_cost, source=source, ref=source[1],
+		t_sc_override=companion_value, cost_version=current.name,
+	)
+
+
+def _assert_stock_available(engine, qty_needed):
+	from sap_valuation.sap_standard_cost.engine import flt as _flt
+
+	periods = engine._periods_present()
+	on_hand = 0.0
+	if periods:
+		y, m = periods[-1]
+		on_hand = engine.end_qty_mtd(y, m)
+	if on_hand - qty_needed < 0:
+		frappe.throw(
+			_("Insufficient stock for {0}: negative stock is blocked for SAP Standard Cost items.").format(
+				engine.item_code
+			),
+			title=_("Negative Stock Blocked"),
+		)
+
+
+def _write_sle_and_state(controller, engine, sle, period, qty, sc, value):
+	"""SLE-compatible row + Bin + Inventory Period Balance at standard cost."""
+	from sap_valuation.sap_moving_average.kernel import ScopeState, recompute_closing, write_sle
+
+	scope = ScopeState(engine.company, engine.item_code, sle.get("warehouse"))
+	ipb = scope.load(period)
+	if qty > 0:
+		ipb.receipt_qty = flt(ipb.receipt_qty) + qty
+		ipb.receipt_value = r2(flt(ipb.receipt_value) + value)
+	else:
+		ipb.issue_qty = flt(ipb.issue_qty) - qty
+		ipb.issue_value = r2(flt(ipb.issue_value) - value)
+	recompute_closing(ipb)
+	ipb.moving_avg_price = sc  # for STD scopes this column carries the active SC
+	scope.save(ipb, source=(controller.doctype, controller.name))
+	write_sle(controller, sle, scope, ipb, value)
+
+
+# ------------------------------------------------------------ value events
+def post_std_value_event(company, item_code, warehouse, *, trans, amount, source,
+		posting_date, offset_account=None):
+	"""LC / invoice-diff / count events from transaction-layer documents."""
+	engine = StdEngine(company, item_code, warehouse)
+	assert_posting_allowed(company, posting_date)
+	scv = get_active_standard_cost(company, item_code, warehouse, posting_date)
+	if trans == "LC":
+		return engine.post(trans="LC", posting_date=posting_date, source=source,
+			t_sc_override=0, t_ac_override=r2(amount), cost_version=scv.name)
+	frappe.throw(_("Unsupported STD value event {0}").format(trans))
+
+
+def handle_std_landed_cost(lcv, routed_rows):
+	"""Called from the shared LCV handler for STD items: charge -> PPV pool."""
+	total_charges = sum(flt(t.base_amount or t.amount) for t in lcv.get("taxes") or [])
+	for row in routed_rows:
+		amount = flt(row.applicable_charges)
+		if not amount:
+			continue
+		warehouse = frappe.db.get_value(
+			row.receipt_document_type + " Item", row.purchase_receipt_item, "warehouse"
+		) if row.get("purchase_receipt_item") else None
+		for tax in lcv.get("taxes") or []:
+			share = flt(tax.base_amount or tax.amount) / total_charges if total_charges else 0
+			if not share:
+				continue
+			engine = StdEngine(lcv.company, row.item_code, warehouse)
+			scv = get_active_standard_cost(lcv.company, row.item_code, warehouse, lcv.posting_date)
+			ive = engine.post(trans="LC", posting_date=lcv.posting_date,
+				source=("Landed Cost Voucher", lcv.name, row.name),
+				t_sc_override=0, t_ac_override=r2(amount * share), cost_version=scv.name,
+				post_gl=False)
+			engine._post_gl(ive, "LC", 0, r2(amount * share),
+				offset_override=tax.expense_account)
+	return True
+
+
+def on_purchase_invoice_submit_std(doc, item, pr_row):
+	"""PI price difference for an STD item -> PPV pool (invoice diff)."""
+	qty = flt(item.qty)
+	base_diff = r2((flt(item.base_net_rate) - flt(pr_row.base_net_rate)) * qty)
+	if not base_diff:
+		return
+	engine = StdEngine(doc.company, item.item_code, pr_row.warehouse)
+	scv = get_active_standard_cost(doc.company, item.item_code, pr_row.warehouse, doc.posting_date)
+	srbnb = frappe.get_cached_value("Company", doc.company, "stock_received_but_not_billed")
+	ive = engine.post(trans="LC", posting_date=doc.posting_date,
+		source=("Purchase Invoice", doc.name, item.name),
+		t_sc_override=0, t_ac_override=base_diff, cost_version=scv.name, post_gl=False)
+	engine._post_gl(ive, "LC", 0, base_diff, offset_override=srbnb)

@@ -40,7 +40,8 @@ def on_purchase_invoice_submit(doc, method=None):
 	for item in doc.items:
 		if not (item.purchase_receipt and item.pr_detail):
 			continue
-		if get_valuation_method(item.item_code, doc.company) not in kernel_map:
+		method = get_valuation_method(item.item_code, doc.company)
+		if method not in kernel_map:
 			continue
 
 		pr_row = frappe.db.get_value(
@@ -50,6 +51,12 @@ def on_purchase_invoice_submit(doc, method=None):
 			as_dict=True,
 		)
 		if not pr_row:
+			continue
+
+		if method == "SAP Standard Cost":
+			from sap_valuation.sap_standard_cost.kernel import on_purchase_invoice_submit_std
+
+			on_purchase_invoice_submit_std(doc, item, pr_row)
 			continue
 
 		qty = flt(item.qty)

@@ -50,6 +50,13 @@ def get_custom_fields():
 		],
 		"Item Group": [
 			{
+				"fieldname": "default_settlement_view",
+				"label": "Default Settlement View (SAP Standard Cost)",
+				"fieldtype": "Select",
+				"options": "\nMTD\nYTD",
+				"insert_after": "item_group_defaults",
+			},
+			{
 				"fieldname": "item_group_default_warehouse_accounts",
 				"label": "Warehouse-level Default Accounts (SAP Valuation)",
 				"fieldtype": "Table",

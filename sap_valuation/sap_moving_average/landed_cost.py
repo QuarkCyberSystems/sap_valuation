@@ -29,10 +29,8 @@ def handle_landed_cost(lcv):
 	if not items or not kernel_map:
 		return False
 
-	routed = [
-		row for row in items
-		if get_valuation_method(row.item_code, lcv.company) in kernel_map
-	]
+	methods = {row.name: get_valuation_method(row.item_code, lcv.company) for row in items}
+	routed = [row for row in items if methods[row.name] in kernel_map]
 	if not routed:
 		return False
 	if len(routed) != len(items):
@@ -49,6 +47,13 @@ def handle_landed_cost(lcv):
 			_("Landed Cost Vouchers for SAP-valuation items cannot be cancelled. Use Create Cancellation."),
 			title=_("Immutable Ledger"),
 		)
+
+	std_rows = [row for row in routed if methods[row.name] == "SAP Standard Cost"]
+	if std_rows:
+		from sap_valuation.sap_standard_cost.kernel import handle_std_landed_cost
+
+		handle_std_landed_cost(lcv, std_rows)
+	routed = [row for row in routed if methods[row.name] != "SAP Standard Cost"]
 
 	# proportional credit against each charge row's expense account
 	total_charges = sum(flt(t.base_amount or t.amount) for t in lcv.get("taxes") or [])
