@@ -140,6 +140,7 @@ def run(commit=False):
 		check("settled period blocks vouchers", True)
 
 	run_reversals(company, wh)
+	run_sce_isvc(company)
 
 	failed = [x for x in CHECKS if not x[1]]
 	print(f"\n{len(CHECKS) - len(failed)}/{len(CHECKS)} checks passed")
@@ -226,3 +227,53 @@ def run_reversals(company, wh):
 	# variance of the reversed issue is zero, so the current pool is untouched
 	check("current pool untouched by issue reversal",
 		flt(eng.own_ppv(2026, 6), 2) == 0, str(eng.own_ppv(2026, 6)))
+
+
+def run_sce_isvc(company):
+	"""SCE roll-up releases a cost version; ISVC governs the view flip."""
+	today = getdate(nowdate())
+	comp = "_STDV-COMP"
+	fg = "_STDV-FG"
+	for code, method in ((comp, "SAP Standard Cost"), (fg, "SAP Standard Cost")):
+		if not frappe.db.exists("Item", code):
+			frappe.get_doc({"doctype": "Item", "item_code": code, "item_name": code,
+				"item_group": frappe.get_all("Item Group", filters={"is_group": 0}, limit=1, pluck="name")[0],
+				"stock_uom": frappe.get_all("UOM", limit=1, pluck="name")[0],
+				"is_stock_item": 1, "valuation_method": method,
+				"settlement_view": "MTD"}).insert(ignore_permissions=True)
+	scv_c = frappe.get_doc({"doctype": "Item Standard Cost Version", "company": company,
+		"item_code": comp, "valid_from_year": today.year, "valid_from_month": today.month,
+		"standard_cost": 4, "source_type": "MANUAL_OVERRIDE"})
+	scv_c.insert(ignore_permissions=True)
+	scv_c.release()
+
+	sce = frappe.get_doc({"doctype": "Standard Cost Estimate", "company": company,
+		"item_code": fg, "valid_from_year": today.year, "valid_from_month": today.month,
+		"overhead_percent": 10,
+		"components": [{"item_code": comp, "qty": 5, "rate_source": "LEAF_STD"}]})
+	sce.insert(ignore_permissions=True)
+	sce.calculate()
+	check("SCE roll-up 5x4 +10% = 22", flt(sce.standard_cost, 2) == 22.00, sce.standard_cost)
+	scv_name = sce.release()
+	scv = frappe.get_doc("Item Standard Cost Version", scv_name)
+	check("SCE release creates RELEASED SCV (source SCE)",
+		scv.status == "RELEASED" and scv.source_type == "SCE"
+		and flt(scv.standard_cost) == 22, scv.status)
+
+	# ---- ISVC: SoD + unsettled-period gate + flip
+	isvc = frappe.get_doc({"doctype": "Item Settlement View Change", "company": company,
+		"item_code": fg, "to_view": "YTD", "reason": "slow mover"})
+	isvc.insert(ignore_permissions=True)
+	check("ISVC captures from-view MTD", isvc.from_view == "MTD", isvc.from_view)
+	try:
+		isvc.approve()
+		check("ISVC self-approval blocked", False, "approved")
+	except frappe.ValidationError:
+		check("ISVC self-approval blocked", True)
+	approver = frappe.get_all("User", filters={"name": ("not in", [frappe.session.user, "Guest"])}, limit=1, pluck="name")[0]
+	isvc.db_set({"status": "Approved", "approved_by": approver})
+	isvc.reload()
+	isvc.submit()
+	check("ISVC flips view to YTD",
+		frappe.db.get_value("Item", fg, "settlement_view") == "YTD"
+		and isvc.status == "Posted", isvc.status)
