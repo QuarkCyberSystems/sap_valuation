@@ -41,9 +41,11 @@ TRANS_FLAGS = {
 	"Sett - Rev":         Flags("",    0, 0, 1, 0, 0),
 	"Sett - Reverse":     Flags("",    0, 0, 1, 0, 0),
 	"Sett - Rev - Reverse": Flags("",  0, 0, 1, 0, 0),
+	# post-close allocation correction (delta engine, exact-reversal path)
+	"Sett - Delta":         Flags("",  0, 0, 1, 0, 0),
 }
 
-SETT_FAMILY = frozenset({"Sett", "Sett - Rev", "Sett - Reverse", "Sett - Rev - Reverse"})
+SETT_FAMILY = frozenset({"Sett", "Sett - Rev", "Sett - Reverse", "Sett - Rev - Reverse", "Sett - Delta"})
 BD_BY_PRIMARIES = frozenset({"REC (BD)", "Issue (BD)", "REC (BY)", "Issue (BY)"})
 
 # YTD flag override (the one matrix difference)

@@ -54,11 +54,6 @@ def post_via_sap_std_kernel(controller, sl_entries):
 
 	is_return = bool(controller.get("is_return"))
 	is_cancellation = bool(controller.get("is_cancellation"))
-	if is_cancellation:
-		frappe.throw(
-			_("Cancellation documents for SAP Standard Cost items arrive in Phase 4 (exact reversal with reference)."),
-			title=_("Not Supported Yet"),
-		)
 
 	entries = sorted(
 		sl_entries,
@@ -84,6 +79,10 @@ def _post_entry(controller, sle, is_return):
 	posting_date = getdate(sle.get("posting_date"))
 	period = assert_posting_allowed(company, posting_date)
 	engine = StdEngine(company, item_code, sle.get("warehouse"))
+
+	if controller.get("is_cancellation"):
+		_post_cancellation_std(controller, engine, sle, period)
+		return
 
 	today = getdate(frappe.utils.nowdate())
 	cross_month = (posting_date.year, posting_date.month) != (today.year, today.month)
@@ -122,6 +121,54 @@ def _post_entry(controller, sle, is_return):
 		value = r2(qty * sc)
 
 	_write_sle_and_state(controller, engine, sle, period, qty, sc, value)
+
+
+def _post_cancellation_std(controller, engine, sle, period):
+	"""Exact reversal with reference for a same-doctype Cancellation document."""
+	original = controller.get("cancellation_against")
+	if not original:
+		frappe.throw(_("Cancellation document must reference the original via Cancellation Against."))
+	detail = sle.get("voucher_detail_no")
+	row = next((x for x in controller.get("items") or [] if x.name == detail), None)
+	orig_detail = row and (
+		row.get("purchase_receipt_item") or row.get("dn_detail") or row.get("delivery_note_item")
+	)
+	filters = {
+		"source_doctype": controller.doctype, "source_docname": original,
+		"item_code": engine.item_code, "is_cancelled": 0,
+		"std_trans": ("!=", ""),
+	}
+	if orig_detail:
+		filters["source_detail_name"] = orig_detail
+	originals = frappe.get_all("Inventory Valuation Event", filters=filters, pluck="name")
+	if not originals:
+		frappe.throw(_("No STD valuation events found for {0} to reverse.").format(original))
+
+	source = (controller.doctype, controller.name, detail)
+	mirror = None
+	for name in originals:
+		mirror = engine.reverse_event(name, source=source,
+			posting_date=sle.get("posting_date"))
+
+	# SLE-compatible row + state at the ORIGINAL standard cost
+	orig_ive = frappe.get_doc("Inventory Valuation Event", originals[0])
+	qty = -flt(orig_ive.qty_adj)
+	value = -flt(orig_ive.total_sc)
+	from sap_valuation.sap_moving_average.kernel import ScopeState, recompute_closing, write_sle
+
+	scope = ScopeState(engine.company, engine.item_code, sle.get("warehouse"))
+	ipb = scope.load(period)
+	if qty > 0:
+		ipb.receipt_qty = flt(ipb.receipt_qty) + qty
+		ipb.receipt_value = r2(flt(ipb.receipt_value) + value)
+	elif qty < 0:
+		ipb.issue_qty = flt(ipb.issue_qty) - qty
+		ipb.issue_value = r2(flt(ipb.issue_value) - value)
+	recompute_closing(ipb)
+	scope.save(ipb, source=(controller.doctype, controller.name))
+	mirrored = dict(sle)
+	mirrored["actual_qty"] = qty
+	write_sle(controller, mirrored, scope, ipb, value)
 
 
 def _post_companion_if_needed(engine, controller, sle, trans, qty, sc_original, source, today):

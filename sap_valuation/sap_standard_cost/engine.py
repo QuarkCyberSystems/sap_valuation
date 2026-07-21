@@ -164,7 +164,7 @@ class StdEngine:
 	# ------------------------------------------------------------------ post
 	def post(self, *, trans, posting_date, qty=None, sc=None, ac=None, source,
 			entry_date=None, ref="", t_sc_override=None, t_ac_override=None,
-			cost_version=None, post_gl=True):
+			cost_version=None, post_gl=True, qty_adj_override=None, reversal_of=None):
 		"""Append one STD event (and its GL unless Sett-family)."""
 		flags = flags_for(trans, self.view)
 		pst = getdate(posting_date)
@@ -186,7 +186,9 @@ class StdEngine:
 				).format(trans)
 			)
 
-		if trans.endswith("Rev") or trans.startswith("Rev") or trans.startswith("Sett") or qty is None:
+		if qty_adj_override is not None:
+			qty_adj = flt(qty_adj_override)
+		elif trans.endswith("Rev") or trans.startswith("Rev") or trans.startswith("Sett") or qty is None:
 			qty_adj = 0.0
 		else:
 			qty_adj = flt(qty) if flags.mvt == "In" else (-flt(qty) if flags.mvt == "Out" else 0.0)
@@ -235,6 +237,7 @@ class StdEngine:
 				"rev_flag": flags.rev,
 				"settlement_ref": str(ref) if ref else "",
 				"cost_version": cost_version,
+				"reversal_of": reversal_of,
 			}).insert(ignore_permissions=True)
 		finally:
 			frappe.flags[KERNEL_FLAG] = False
@@ -608,3 +611,112 @@ class StdEngine:
 			"reversed_by_events": f"{reverse_event.name},{rev_reverse_event.name}",
 		}, update_modified=False)
 		return reverse_event, rev_reverse_event
+
+
+	# ------------------------------------------------- exact reversal (Phase 4)
+	def reverse_event(self, original_name, *, source, posting_date=None, entry_date=None):
+		"""EXACT_REVERSAL_WITH_REFERENCE (client appendix, reversal matrix).
+
+		Measured entirely from the ORIGINAL event (original SC, original
+		variance, original cost version — never current STD). Legally posted:
+		- original period still open  -> into the original period
+		- original period settled     -> current-dated; the caller then runs
+		  post_close_delta() for every live settlement of that period (the
+		  variance portion re-enters the current pool via the event flags)
+		"""
+		orig = frappe.get_doc("Inventory Valuation Event", original_name)
+		if frappe.db.exists("Inventory Valuation Event",
+				{"reversal_of": original_name, "is_cancelled": 0}):
+			frappe.throw(_("{0} is already reversed.").format(original_name),
+				title=_("Double Reversal Blocked"))
+
+		locked = self.is_period_locked(orig.period_year, orig.period_month)
+		pst = posting_date or (getdate(frappe.utils.nowdate()) if locked else orig.posting_date)
+
+		mirror = self.post(
+			trans=orig.std_trans, posting_date=pst, source=source, entry_date=entry_date,
+			ref=orig.name, sc=orig.standard_cost, ac=orig.actual_cost,
+			qty_adj_override=-flt(orig.qty_adj),
+			t_sc_override=-flt(orig.total_sc), t_ac_override=-flt(orig.total_ac),
+			cost_version=orig.cost_version, post_gl=False, reversal_of=orig.name,
+		)
+		# GL: mirror the original's legs with sides swapped, on the reversal date
+		from erpnext.accounts.general_ledger import make_gl_entries
+
+		gl_map = []
+		cost_center = frappe.get_cached_value("Company", self.company, "cost_center")
+		for g in frappe.get_all("GL Entry",
+				filters={"valuation_event_id": original_name, "is_cancelled": 0},
+				fields=["account", "debit", "credit"]):
+			gl_map.append(frappe._dict({
+				"account": g.account, "against": "",
+				"debit": flt(g.credit), "credit": flt(g.debit),
+				"debit_in_account_currency": flt(g.credit),
+				"credit_in_account_currency": flt(g.debit),
+				"posting_date": pst, "voucher_type": source[0], "voucher_no": source[1],
+				"company": self.company, "cost_center": cost_center,
+				"remarks": _("Exact reversal of {0}").format(original_name),
+				"valuation_event_id": mirror.name,
+			}))
+		if gl_map:
+			make_gl_entries(gl_map, merge_entries=False)
+
+		if locked:
+			for sett in self.settlements(live_only=True):
+				if (sett.period_year, sett.period_month) == (orig.period_year, orig.period_month):
+					self.post_close_delta(sett, orig, source, entry_date=entry_date)
+		return mirror
+
+	def post_close_delta(self, sett, reversed_orig, source, entry_date=None):
+		"""Forward allocation correction after reversing into a settled period
+		(client worked example: end 40->50 => Dr Inventory 8 / Cr COGS Adj 8).
+
+		Pool is unchanged; the quantity basis moves by the reversed event's
+		qty_adj: in-flag events change In, out-flag events change Out/End.
+		"""
+		qd = flt(reversed_orig.qty_adj)
+		beg, in_q = flt(sett.beg_qty), flt(sett.in_qty)
+		end, out = flt(sett.es_qty), flt(sett.out_qty)
+		if reversed_orig.in_flag:
+			in_q -= qd
+			end -= qd
+		elif reversed_orig.out_flag:
+			out += qd  # reversing an issue (qty_adj negative) reduces Out
+			end -= qd
+		else:
+			return
+		var = flt(sett.variance)
+		denom = beg + in_q
+		new_es = r2(var * end / denom) if denom else 0.0
+		new_out = r2(var * out / denom) if denom else 0.0
+		d_es = r2(new_es - flt(sett.es_var))
+		d_out = r2(new_out - flt(sett.out_var))
+		if not d_es and not d_out:
+			return
+
+		today = getdate(frappe.utils.nowdate())
+		delta_ive = self.post(trans="Sett - Delta", posting_date=today, source=source,
+			entry_date=entry_date, ref=sett.name, t_sc_override=d_es, post_gl=False)
+
+		from erpnext.accounts.general_ledger import make_gl_entries
+
+		a = self.accounts()
+		cost_center = frappe.get_cached_value("Company", self.company, "cost_center")
+		gl_map = []
+		for account, amount in ((a.stock, d_es), (a.cogs_adj, d_out)):
+			amount = r2(amount)
+			if not amount:
+				continue
+			gl_map.append(frappe._dict({
+				"account": account, "against": "",
+				"debit": amount if amount > 0 else 0, "credit": -amount if amount < 0 else 0,
+				"debit_in_account_currency": amount if amount > 0 else 0,
+				"credit_in_account_currency": -amount if amount < 0 else 0,
+				"posting_date": today, "voucher_type": source[0], "voucher_no": source[1],
+				"company": self.company, "cost_center": cost_center,
+				"remarks": _("Post-close allocation delta for {0}").format(sett.name),
+				"valuation_event_id": delta_ive.name,
+			}))
+		if gl_map:
+			make_gl_entries(gl_map, merge_entries=False)
+		return delta_ive

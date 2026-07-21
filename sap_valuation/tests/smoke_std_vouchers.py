@@ -139,6 +139,8 @@ def run(commit=False):
 	except frappe.ValidationError:
 		check("settled period blocks vouchers", True)
 
+	run_reversals(company, wh)
+
 	failed = [x for x in CHECKS if not x[1]]
 	print(f"\n{len(CHECKS) - len(failed)}/{len(CHECKS)} checks passed")
 	if commit and not failed:
@@ -147,3 +149,80 @@ def run(commit=False):
 		frappe.db.rollback()
 	if failed:
 		raise Exception("STD voucher failures: " + "; ".join(x[0] for x in failed))
+
+
+def run_reversals(company, wh):
+	"""Phase-4: exact reversal with reference — open period + settled period."""
+	from sap_valuation.sap_moving_average.cancellation import make_cancellation
+	from sap_valuation.sap_standard_cost.engine import StdEngine
+
+	item = "_STDV-CXL"
+	if not frappe.db.exists("Item", item):
+		frappe.get_doc({"doctype": "Item", "item_code": item, "item_name": item,
+			"item_group": frappe.get_all("Item Group", filters={"is_group": 0}, limit=1, pluck="name")[0],
+			"stock_uom": frappe.get_all("UOM", limit=1, pluck="name")[0],
+			"is_stock_item": 1, "valuation_method": "SAP Standard Cost",
+			"settlement_view": "MTD"}).insert(ignore_permissions=True)
+	today = getdate(nowdate())
+	scv = frappe.get_doc({"doctype": "Item Standard Cost Version", "company": company,
+		"item_code": item, "valid_from_year": today.year, "valid_from_month": today.month,
+		"standard_cost": 10, "source_type": "MANUAL_OVERRIDE"})
+	scv.insert(ignore_permissions=True)
+	scv.release()
+
+	# --- open-period reversal via Create Cancellation (PR at AC 12, PPV 200)
+	pr = make_pr(item, wh, 100, 12)
+	cxl = frappe.get_doc("Purchase Receipt", make_cancellation("Purchase Receipt", pr.name))
+	cxl.submit()
+	mirror = frappe.get_all("Inventory Valuation Event",
+		filters={"source_docname": cxl.name}, fields=["std_trans", "total_sc", "total_ac", "reversal_of"])
+	check("open-period reversal mirrors original (SC -1000 / AC -1200, linked)",
+		mirror and mirror[0].std_trans == "Rec" and flt(mirror[0].total_sc) == -1000
+		and flt(mirror[0].total_ac) == -1200 and mirror[0].reversal_of, str(mirror))
+	gl = frappe.get_all("GL Entry", filters={"voucher_no": cxl.name, "is_cancelled": 0},
+		fields=["debit", "credit"])
+	check("reversal GL balanced 1200/1200",
+		flt(sum(g.debit for g in gl), 2) == flt(sum(g.credit for g in gl), 2) == 1200,
+		str(gl))
+	try:
+		c2 = make_cancellation("Purchase Receipt", pr.name)
+		frappe.get_doc("Purchase Receipt", c2).submit()
+		check("STD double reversal blocked", False, "submitted")
+	except frappe.ValidationError:
+		check("STD double reversal blocked", True)
+
+	# --- settled-period issue reversal (client worked example: +8 / -8)
+	item2 = "_STDV-DELTA"
+	if not frappe.db.exists("Item", item2):
+		frappe.get_doc({"doctype": "Item", "item_code": item2, "item_name": item2,
+			"item_group": frappe.get_all("Item Group", filters={"is_group": 0}, limit=1, pluck="name")[0],
+			"stock_uom": frappe.get_all("UOM", limit=1, pluck="name")[0],
+			"is_stock_item": 1, "valuation_method": "SAP Standard Cost",
+			"settlement_view": "MTD"}).insert(ignore_permissions=True)
+	eng = StdEngine(company, item2)
+	src = ("Item Standard Cost Version", scv.name)
+	# May: input 100 with var 80 (ac 10.8), issues 60 -> end 40; settle 32/48
+	eng.post(trans="Rec", qty=100, sc=10, ac=10.8, posting_date="2026-05-03", source=src)
+	iss = eng.post(trans="Iss", qty=10, sc=10, posting_date="2026-05-10", source=src)
+	eng.post(trans="Iss", qty=50, sc=10, posting_date="2026-05-15", source=src)
+	sett = eng.close_period(year=2026, month=5, sc=10, source=src, entry_date="2026-06-01")
+	check("worked-example settle 32/48",
+		flt(sett.es_var, 2) == 32.00 and flt(sett.out_var, 2) == 48.00,
+		f"{sett.es_var}/{sett.out_var}")
+
+	eng.reverse_event(iss.name, source=src, posting_date="2026-06-05")
+	delta = frappe.get_all("Inventory Valuation Event",
+		filters={"item_code": item2, "std_trans": "Sett - Delta"}, fields=["name", "total_sc"])
+	check("post-close delta event +8", delta and flt(delta[0].total_sc, 2) == 8.00, str(delta))
+	dgl = frappe.get_all("GL Entry",
+		filters={"valuation_event_id": delta[0].name if delta else "x", "is_cancelled": 0},
+		fields=["account", "debit", "credit"])
+	a = eng.accounts()
+	inv_leg = next((g for g in dgl if g.account == a.stock), None)
+	adj_leg = next((g for g in dgl if g.account == a.cogs_adj), None)
+	check("delta GL: Dr Inventory 8 / Cr COGS Adjustment 8",
+		inv_leg and flt(inv_leg.debit, 2) == 8.00 and adj_leg and flt(adj_leg.credit, 2) == 8.00,
+		str(dgl))
+	# variance of the reversed issue is zero, so the current pool is untouched
+	check("current pool untouched by issue reversal",
+		flt(eng.own_ppv(2026, 6), 2) == 0, str(eng.own_ppv(2026, 6)))
