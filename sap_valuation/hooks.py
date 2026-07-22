@@ -28,6 +28,13 @@ after_install = ["sap_valuation.setup.custom_fields.apply_custom_fields"]
 
 app_include_js = "/assets/sap_valuation/js/cancellation_button.js"
 
+# boundary revaluations for advance-released cost versions (M11/DR-12)
+scheduler_events = {
+	"daily": [
+		"sap_valuation.sap_standard_cost.doctype.item_standard_cost_version.item_standard_cost_version.materialize_pending_revaluations",
+	],
+}
+
 # Universal cancellation rule: docstatus 1 -> 2 is never allowed for documents
 # containing SAP-valuation items; a dated Cancellation document is used instead.
 _cancel_guard = {"before_cancel": "sap_valuation.overrides.cancel_guard.block_direct_cancel"}

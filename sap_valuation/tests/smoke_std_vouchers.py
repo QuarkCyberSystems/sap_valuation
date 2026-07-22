@@ -141,6 +141,7 @@ def run(commit=False):
 
 	run_reversals(company, wh)
 	run_sce_isvc(company)
+	run_boundary_scv(company, wh)
 
 	failed = [x for x in CHECKS if not x[1]]
 	print(f"\n{len(CHECKS) - len(failed)}/{len(CHECKS)} checks passed")
@@ -277,3 +278,80 @@ def run_sce_isvc(company):
 	check("ISVC flips view to YTD",
 		frappe.db.get_value("Item", fg, "settlement_view") == "YTD"
 		and isvc.status == "Posted", isvc.status)
+
+
+def run_boundary_scv(company, wh):
+	"""M11: a future-effective release posts NO triplet now; the boundary
+	materializer posts it once the period arrives (simulated by aging the
+	valid-from back to the current month)."""
+	from dateutil.relativedelta import relativedelta
+
+	from sap_valuation.sap_standard_cost.doctype.item_standard_cost_version.item_standard_cost_version import (
+		materialize_pending_revaluations,
+	)
+
+	item = "_STDV-BOUND"
+	if not frappe.db.exists("Item", item):
+		frappe.get_doc({"doctype": "Item", "item_code": item, "item_name": item,
+			"item_group": frappe.get_all("Item Group", filters={"is_group": 0}, limit=1, pluck="name")[0],
+			"stock_uom": frappe.get_all("UOM", limit=1, pluck="name")[0],
+			"is_stock_item": 1, "valuation_method": "SAP Standard Cost",
+			"settlement_view": "MTD"}).insert(ignore_permissions=True)
+
+	today = getdate(nowdate())
+	scv1 = frappe.get_doc({"doctype": "Item Standard Cost Version", "company": company,
+		"item_code": item, "valid_from_year": today.year, "valid_from_month": today.month,
+		"standard_cost": 10, "source_type": "MANUAL_OVERRIDE"})
+	scv1.insert(ignore_permissions=True)
+	scv1.release()
+	make_pr(item, wh, 50, 10)
+
+	nxt = today + relativedelta(months=1)
+	scv2 = frappe.get_doc({"doctype": "Item Standard Cost Version", "company": company,
+		"item_code": item, "valid_from_year": nxt.year, "valid_from_month": nxt.month,
+		"standard_cost": 12, "source_type": "MANUAL_OVERRIDE"})
+	scv2.insert(ignore_permissions=True)
+	scv2.release()
+
+	revs = frappe.get_all("Inventory Valuation Event",
+		filters={"item_code": item, "std_trans": ("in", ("Rev Beg", "REV In", "REV out"))})
+	check("future-effective release posts no triplet at release",
+		not revs and not frappe.db.get_value(
+			"Item Standard Cost Version", scv2.name, "revaluation_posted"), str(revs))
+
+	sc = frappe.db.get_value  # active SC today must still be v1
+	from sap_valuation.sap_standard_cost.engine import get_active_standard_cost
+	active = get_active_standard_cost(company, item, wh, today)
+	check("pending future version does not price today's postings",
+		active and flt(active.standard_cost) == 10, str(active and active.standard_cost))
+
+	# boundary arrives: age the version back to the current month, then materialize
+	frappe.db.set_value("Item Standard Cost Version", scv2.name,
+		{"valid_from_year": today.year, "valid_from_month": today.month},
+		update_modified=False)
+	materialize_pending_revaluations()
+
+	revs = frappe.get_all("Inventory Valuation Event",
+		filters={"item_code": item, "std_trans": ("in", ("Rev Beg", "REV In", "REV out"))},
+		fields=["std_trans", "total_sc"])
+	# receipt landed in the simulated boundary month itself, so the granular
+	# triplet classifies it as REV In; net reval value must be 50 x 2 = 100
+	total = flt(sum(r.total_sc for r in revs), 2)
+	check("materializer posts boundary reval (net 50x2=100)",
+		revs and total == 100
+		and frappe.db.get_value("Item Standard Cost Version", scv2.name, "revaluation_posted"),
+		str(revs))
+
+	# frozen-target guard: a version aimed at a SETTLED_FROZEN period is refused
+	frozen = frappe.get_all("Inventory Period",
+		filters={"company": company, "status": "SETTLED_FROZEN"}, limit=1,
+		fields=["period_year", "period_month"])
+	if frozen:
+		try:
+			frappe.get_doc({"doctype": "Item Standard Cost Version", "company": company,
+				"item_code": item, "valid_from_year": frozen[0].period_year,
+				"valid_from_month": frozen[0].period_month,
+				"standard_cost": 15, "source_type": "MANUAL_OVERRIDE"}).insert(ignore_permissions=True)
+			check("frozen-target SCV refused", False, "inserted")
+		except frappe.ValidationError:
+			check("frozen-target SCV refused", True)

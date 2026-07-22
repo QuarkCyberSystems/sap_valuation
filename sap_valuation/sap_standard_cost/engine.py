@@ -104,7 +104,19 @@ def get_active_standard_cost(company, item_code, warehouse, posting_date):
 			title=_("No Standard Cost"),
 		)
 	best = max(candidates, key=lambda x: (x.valid_from_year, x.valid_from_month, x.released_on or ""))
+	_materialize_if_pending(best.name)
 	return best
+
+
+def _materialize_if_pending(scv_name):
+	"""Lazy backstop for boundary revaluations (M11): if the resolved version
+	became effective without its triplet, post it before pricing anything."""
+	row = frappe.db.get_value(
+		"Item Standard Cost Version", scv_name, ["revaluation_posted"], as_dict=True,
+	)
+	if not row or row.revaluation_posted or frappe.flags.in_scv_materialize:
+		return
+	frappe.get_doc("Item Standard Cost Version", scv_name).materialize_boundary()
 
 
 def _derive_std_intent(trans, reversal_of=None):
