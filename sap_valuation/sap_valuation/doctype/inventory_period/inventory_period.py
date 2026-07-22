@@ -6,12 +6,13 @@ from frappe import _
 from frappe.model.document import Document
 from frappe.utils import get_first_day, get_last_day, getdate
 
-# Legal transitions of the 5-state period machine (signed MAP plan §Period Model).
+# Legal transitions of the period machine (DR-25). The plan's intermediate
+# SETTLEMENT_ALLOWED / SETTLING_LOCKED phases never occur in this build: the
+# close ceremony validates and freezes inside one transaction, so the ledger
+# is never observable in a half-locked state.
 STATE_TRANSITIONS = {
 	"OPEN": {"PREV_OPEN_UNSETTLED"},
-	"PREV_OPEN_UNSETTLED": {"PREV_OPEN_SETTLEMENT_ALLOWED"},
-	"PREV_OPEN_SETTLEMENT_ALLOWED": {"SETTLING_LOCKED"},
-	"SETTLING_LOCKED": {"SETTLED_FROZEN", "PREV_OPEN_SETTLEMENT_ALLOWED"},
+	"PREV_OPEN_UNSETTLED": {"SETTLED_FROZEN"},
 	"SETTLED_FROZEN": set(),
 }
 
@@ -66,7 +67,7 @@ class InventoryPeriod(Document):
 			"Inventory Period",
 			{
 				"company": self.company,
-				"status": ("in", ["PREV_OPEN_UNSETTLED", "PREV_OPEN_SETTLEMENT_ALLOWED"]),
+				"status": "PREV_OPEN_UNSETTLED",
 				"name": ("!=", self.name),
 			},
 		):

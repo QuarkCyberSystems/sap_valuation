@@ -76,7 +76,7 @@
    "in_list_view": 1,
    "in_standard_filter": 1,
    "label": "Status",
-   "options": "OPEN\nPREV_OPEN_UNSETTLED\nPREV_OPEN_SETTLEMENT_ALLOWED\nSETTLING_LOCKED\nSETTLED_FROZEN",
+   "options": "OPEN\nPREV_OPEN_UNSETTLED\nSETTLED_FROZEN",
    "reqd": 1
   },
   {

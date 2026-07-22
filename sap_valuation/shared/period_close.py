@@ -179,13 +179,14 @@ def seed_next_period_openings(period):
 		(period.period_year + 1, 1) if period.period_month == 12 else (period.period_year, period.period_month + 1)
 	)
 
-	# Freeze any older previous-open period: MAP has no settlement phase, so it
-	# goes straight to SETTLED_FROZEN once a newer period closes behind it.
+	# Freeze any older previous-open period: the close ceremony validates and
+	# freezes in one transaction, so it goes straight to SETTLED_FROZEN once a
+	# newer period closes behind it (DR-25).
 	older = frappe.get_all(
 		"Inventory Period",
 		filters={
 			"company": period.company,
-			"status": ("in", ["PREV_OPEN_UNSETTLED", "PREV_OPEN_SETTLEMENT_ALLOWED"]),
+			"status": "PREV_OPEN_UNSETTLED",
 			"name": ("!=", period.name),
 		},
 		pluck="name",
