@@ -43,6 +43,8 @@ doc_events = {
 	"Subcontracting Receipt": _cancel_guard,
 	"Landed Cost Voucher": _cancel_guard,
 	"Stock Reconciliation": _cancel_guard,
+	# defaults-as-templates: blank STD items get the group default stamped on save
+	"Item": {"validate": "sap_valuation.overrides.cancel_guard.stamp_settlement_view"},
 	# No-manual-drift rule: JEs cannot hit kernel-maintained inventory accounts
 	"Journal Entry": {
 		"validate": "sap_valuation.overrides.journal_guard.block_manual_stock_journal",

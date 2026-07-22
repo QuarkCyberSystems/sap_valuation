@@ -43,3 +43,14 @@ def block_direct_cancel(doc, method=None):
 		),
 		title=_("Cancellation Blocked"),
 	)
+
+
+def stamp_settlement_view(doc, method=None):
+	"""Item validate hook: copy the group default onto a blank SAP Standard
+	Cost item so the operative config is always visible on the item itself
+	(defaults-as-templates, DR-22). Company default stamps at first posting."""
+	if doc.valuation_method != "SAP Standard Cost" or doc.settlement_view in ("MTD", "YTD"):
+		return
+	group_view = frappe.db.get_value("Item Group", doc.item_group, "default_settlement_view")
+	if group_view in ("MTD", "YTD"):
+		doc.settlement_view = group_view

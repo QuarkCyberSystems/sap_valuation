@@ -61,14 +61,21 @@ def get_std_setting(company, key):
 
 
 def get_settlement_view(company, item_code):
+	"""The item's own field is the single operative config. Group/company
+	defaults are TEMPLATES: the first time a blank item resolves through one,
+	the resolved value is stamped onto the item — later edits to defaults
+	never touch existing items (defaults-as-templates model, DR-22)."""
 	view = frappe.get_cached_value("Item", item_code, "settlement_view")
 	if view in ("MTD", "YTD"):
 		return view
 	item_group = frappe.get_cached_value("Item", item_code, "item_group")
 	group_view = frappe.db.get_value("Item Group", item_group, "default_settlement_view")
-	if group_view in ("MTD", "YTD"):
-		return group_view
-	return get_std_setting(company, "default_settlement_view") or "MTD"
+	resolved = group_view if group_view in ("MTD", "YTD") else (
+		get_std_setting(company, "default_settlement_view") or "MTD"
+	)
+	frappe.db.set_value("Item", item_code, "settlement_view", resolved, update_modified=False)
+	frappe.clear_document_cache("Item", item_code)
+	return resolved
 
 
 def get_active_standard_cost(company, item_code, warehouse, posting_date):

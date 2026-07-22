@@ -7,7 +7,7 @@ the item's periods must be fully settled under the old view before posting)."""
 import frappe
 from frappe import _
 from frappe.model.document import Document
-from frappe.utils import now_datetime
+from frappe.utils import flt, now_datetime
 
 
 class ItemSettlementViewChange(Document):
@@ -39,17 +39,21 @@ class ItemSettlementViewChange(Document):
 		if self.status != "Approved":
 			frappe.throw(_("Request must be Approved before posting."))
 
-		from sap_valuation.sap_standard_cost.engine import StdEngine
+		from sap_valuation.sap_standard_cost.engine import StdEngine, get_active_standard_cost
 
 		engine = StdEngine(self.company, self.item_code)
+		# atomic: settle any open activity UNDER THE OLD VIEW inside this
+		# transaction, then flip — no window for straddling activity
 		for year, month in engine._periods_present():
-			if not engine.is_period_locked(year, month):
-				frappe.throw(
-					_(
-						"Period {0}-{1:02d} has unsettled activity. Run the settlement under the "
-						"{2} view before changing to {3}."
-					).format(year, month, self.from_view, self.to_view)
-				)
+			if engine.is_period_locked(year, month):
+				continue
+			scv = get_active_standard_cost(
+				self.company, self.item_code, None, f"{year}-{month:02d}-01"
+			)
+			engine.close_period(
+				year=year, month=month, sc=flt(scv.standard_cost),
+				source=(self.doctype, self.name),
+			)
 
 		frappe.db.set_value("Item", self.item_code, "settlement_view", self.to_view,
 			update_modified=False)

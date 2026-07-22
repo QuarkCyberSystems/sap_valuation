@@ -605,6 +605,39 @@ def run_std(company, wh):
 	tc("STD TC-INT", std_intents and all(
 		x.posting_intent == "SYSTEM_GENERATED" for x in std_intents), str(std_intents))
 
+	# --- DR-22 defaults-as-templates + atomic ISVC
+	grp = frappe.get_all("Item Group", filters={"is_group": 0}, limit=1, pluck="name")[0]
+	frappe.db.set_value("Item Group", grp, "default_settlement_view", "YTD")
+	t_item = frappe.get_doc({"doctype": "Item", "item_code": "UAT-STD-TPL",
+		"item_name": "UAT-STD-TPL", "item_group": grp,
+		"stock_uom": frappe.get_all("UOM", limit=1, pluck="name")[0],
+		"is_stock_item": 1, "valuation_method": "SAP Standard Cost"})
+	t_item.insert(ignore_permissions=True)
+	tc("STD TC-M10a", t_item.settlement_view == "YTD", t_item.settlement_view)
+	frappe.db.set_value("Item Group", grp, "default_settlement_view", "MTD")
+	tc("STD TC-M10b",
+		frappe.db.get_value("Item", "UAT-STD-TPL", "settlement_view") == "YTD",
+		"later default edit leaked onto existing item")
+	frappe.db.set_value("Item Group", grp, "default_settlement_view", "")
+
+	# atomic ISVC: unsettled activity is settled under the OLD view by the flip
+	av_item = std_item("UAT-STD-ATOM")
+	release_scv(av_item, 10)
+	make_pr(av_item, wh, 50, 11)
+	isvc2 = frappe.get_doc({"doctype": "Item Settlement View Change", "company": company,
+		"item_code": av_item, "to_view": "YTD", "reason": "atomic flip"})
+	isvc2.insert(ignore_permissions=True)
+	isvc2.db_set({"status": "Approved", "approved_by": approver})
+	isvc2.reload()
+	isvc2.submit()
+	sett_made = frappe.get_all("Inventory Period Settlement",
+		filters={"item_code": av_item, "cancelled": 0},
+		fields=["settlement_view", "ppv_pool"])
+	tc("STD TC-M10c", sett_made and sett_made[0].settlement_view == "MTD"
+		and flt(sett_made[0].ppv_pool, 2) == 50
+		and frappe.db.get_value("Item", av_item, "settlement_view") == "YTD",
+		str(sett_made))
+
 	# --- G MTD vs YTD pool carryforward difference
 	m_item, y_item = std_item("UAT-STD-M"), std_item("UAT-STD-Y", view="YTD")
 	for it in (m_item, y_item):
