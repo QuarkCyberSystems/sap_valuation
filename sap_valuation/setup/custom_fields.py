@@ -115,6 +115,17 @@ def get_custom_fields():
 	for doctype in CANCELLATION_DOCTYPES:
 		custom_fields[doctype] = [
 			{
+				"fieldname": "posting_intent",
+				"label": "Posting Intent",
+				"fieldtype": "Select",
+				"options": "\nNEW_CURRENT_STD_MOVEMENT\nRETURN_WITH_REFERENCE\nEXACT_REVERSAL_WITH_REFERENCE",
+				"read_only": 1,
+				"no_copy": 1,
+				"in_standard_filter": 1,
+				"insert_after": "cancellation_against",
+				"description": "Stamped by the valuation kernel from the action taken; never user-selected.",
+			},
+			{
 				"fieldname": "is_cancellation",
 				"label": "Is Cancellation",
 				"fieldtype": "Check",

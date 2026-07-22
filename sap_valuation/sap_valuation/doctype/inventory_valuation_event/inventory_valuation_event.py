@@ -24,6 +24,29 @@ class InventoryValuationEvent(Document):
 
 	def validate(self):
 		block_update(self)
+		if self.is_new() or self.flags.in_insert:
+			self.validate_posting_intent()
+
+	def validate_posting_intent(self):
+		"""Intent-vs-shape invariants (client appendix, enforced at the ledger
+		boundary so every code path and integration is covered):
+		- an EXACT_REVERSAL must reference the event it reverses
+		- a reversal reference implies the EXACT_REVERSAL intent
+		Legacy rows without an intent are tolerated."""
+		if self.posting_intent == "EXACT_REVERSAL_WITH_REFERENCE" and not self.reversal_of:
+			frappe.throw(
+				_("An exact reversal must reference the original valuation event (Reversal Of)."),
+				title=_("Posting Intent Violation"),
+			)
+		if self.reversal_of and self.posting_intent and \
+				self.posting_intent != "EXACT_REVERSAL_WITH_REFERENCE":
+			frappe.throw(
+				_(
+					"Event references {0} as a reversal but declares intent {1}. A referenced "
+					"reversal always uses the original basis; a posting at current cost is not a reversal."
+				).format(self.reversal_of, self.posting_intent),
+				title=_("Posting Intent Violation"),
+			)
 
 	def on_trash(self):
 		block_delete(self)

@@ -62,6 +62,10 @@ def post_via_sap_std_kernel(controller, sl_entries):
 	}):
 		return
 
+	from sap_valuation.sap_moving_average.kernel import _stamp_document_intent
+
+	_stamp_document_intent(controller, is_cancellation, is_return)
+
 	entries = sorted(
 		sl_entries,
 		key=lambda s: (s.get("item_code"), s.get("warehouse") or "", str(s.get("posting_date"))),

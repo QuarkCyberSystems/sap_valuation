@@ -100,6 +100,17 @@ def get_active_standard_cost(company, item_code, warehouse, posting_date):
 	return best
 
 
+def _derive_std_intent(trans, reversal_of=None):
+	if reversal_of:
+		return "EXACT_REVERSAL_WITH_REFERENCE"
+	if trans in SETT_FAMILY or trans.endswith("Rev") or trans.startswith("Rev") \
+			or trans in ("REV In", "REV out"):
+		return "SYSTEM_GENERATED"
+	if trans in ("PR", "SR"):
+		return "RETURN_WITH_REFERENCE"
+	return "NEW_CURRENT_STD_MOVEMENT"
+
+
 class StdEngine:
 	"""Event-log engine for one valuation scope (company, item [, warehouse])."""
 
@@ -164,7 +175,8 @@ class StdEngine:
 	# ------------------------------------------------------------------ post
 	def post(self, *, trans, posting_date, qty=None, sc=None, ac=None, source,
 			entry_date=None, ref="", t_sc_override=None, t_ac_override=None,
-			cost_version=None, post_gl=True, qty_adj_override=None, reversal_of=None):
+			cost_version=None, post_gl=True, qty_adj_override=None, reversal_of=None,
+			posting_intent=None):
 		"""Append one STD event (and its GL unless Sett-family)."""
 		flags = flags_for(trans, self.view)
 		pst = getdate(posting_date)
@@ -222,6 +234,7 @@ class StdEngine:
 				"source_docname": source[1],
 				"source_detail_name": source[2] if len(source) > 2 else None,
 				"reason_code": "settlement" if trans in SETT_FAMILY else "std_event",
+				"posting_intent": posting_intent or _derive_std_intent(trans, reversal_of),
 				"std_trans": trans,
 				"qty_adj": qty_adj,
 				"qty_basis": abs(qty_adj),

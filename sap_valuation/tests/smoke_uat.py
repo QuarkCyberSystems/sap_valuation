@@ -355,6 +355,24 @@ def run_map(company, wh, prior):
 	frozen_item = make_item("UAT-MAP-FRZ")
 	pr_frz = make_pr(frozen_item, wh, 10, 10, posting_date=str(prior))
 
+	# --- intent stamping (M4): action-derived, visible, immutable
+	intents = {x.reason_code: x.posting_intent for x in frappe.get_all(
+		"Inventory Valuation Event", filters={"item_code": a},
+		fields=["reason_code", "posting_intent"])}
+	doc_intent = frappe.db.get_value("Purchase Receipt", pr_c.name, "posting_intent")
+	cxl_intent = frappe.db.get_value("Purchase Receipt",
+		frappe.db.get_value("Purchase Receipt", {"cancellation_against": pr_c.name}), "posting_intent")
+	tc("MAP TC-INT", intents.get("receipt") == "NEW_CURRENT_STD_MOVEMENT"
+		and intents.get("cancellation") == "EXACT_REVERSAL_WITH_REFERENCE"
+		and intents.get("landed_cost") == "NEW_CURRENT_STD_MOVEMENT"
+		and doc_intent == "NEW_CURRENT_STD_MOVEMENT"
+		and cxl_intent == "EXACT_REVERSAL_WITH_REFERENCE", str(intents))
+	ret_intent = frappe.get_all("Inventory Valuation Event",
+		filters={"item_code": g, "reason_code": "return_with_ref"},
+		fields=["posting_intent"], limit=1)
+	tc("MAP TC-INT2", ret_intent and ret_intent[0].posting_intent == "RETURN_WITH_REFERENCE",
+		str(ret_intent))
+
 	# --- C1 period close gate passes + next period opens (LAST)
 	open_p = frappe.get_all("Inventory Period",
 		filters={"company": company, "status": "OPEN"}, pluck="name")[0]
@@ -579,6 +597,13 @@ def run_std(company, wh):
 		filters={"item_code": d, "std_trans": "Sett - Delta"}, fields=["total_sc"])
 	tc("STD TC-F2", flt(sett_d.es_var, 2) == 32 and delta
 		and flt(delta[0].total_sc, 2) == 8, f"{sett_d.es_var}/{delta}")
+
+	# --- intent stamping on STD events
+	std_intents = frappe.get_all("Inventory Valuation Event",
+		filters={"item_code": a, "std_trans": ("in", ["Sett", "Rev Beg", "REV In"])},
+		fields=["std_trans", "posting_intent"])
+	tc("STD TC-INT", std_intents and all(
+		x.posting_intent == "SYSTEM_GENERATED" for x in std_intents), str(std_intents))
 
 	# --- G MTD vs YTD pool carryforward difference
 	m_item, y_item = std_item("UAT-STD-M"), std_item("UAT-STD-Y", view="YTD")

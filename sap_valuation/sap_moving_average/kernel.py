@@ -163,6 +163,19 @@ def recompute_closing(ipb):
 
 
 # ------------------------------------------------------------------- writers
+SYSTEM_REASONS = {"prd_split", "rounding_cleanup", "settlement", "settlement_reverse"}
+
+
+def _derive_intent(reason):
+	if reason == "cancellation":
+		return "EXACT_REVERSAL_WITH_REFERENCE"
+	if reason == "return_with_ref":
+		return "RETURN_WITH_REFERENCE"
+	if reason in SYSTEM_REASONS:
+		return "SYSTEM_GENERATED"
+	return "NEW_CURRENT_STD_MOVEMENT"
+
+
 def write_events(scope, ipb, *, source, posting_date, movement_type, reason, qty_delta,
 		value_delta, map_before, prd_amount=0, inventory_portion=0, expense_portion=0,
 		fx_variance=0, reference_event=None, reversal_of=None, movement_reversal_of=None,
@@ -208,6 +221,7 @@ def write_events(scope, ipb, *, source, posting_date, movement_type, reason, qty
 				"source_docname": source[1],
 				"source_detail_name": source[2] if len(source) > 2 else None,
 				"reason_code": reason,
+				"posting_intent": _derive_intent(reason),
 				"qty_basis": abs(qty_delta) if qty_delta else 0,
 				"value_delta": r2(value_delta),
 				"inventory_portion": r2(inventory_portion),
@@ -345,6 +359,7 @@ def post_via_sap_ma_kernel(controller, sl_entries):
 	}):
 		return
 
+	_stamp_document_intent(controller, is_cancellation, is_return)
 	transfer_pairs, entries = _pair_transfers(controller, entries)
 	for out_sle, in_sle in transfer_pairs:
 		_post_transfer(controller, out_sle, in_sle)
@@ -469,6 +484,19 @@ def _reconciliation_offset_account(controller, sle):
 	return controller.get("expense_account") or frappe.get_cached_value(
 		"Company", controller.company, "stock_adjustment_account"
 	)
+
+
+def _stamp_document_intent(controller, is_cancellation, is_return):
+	"""Visible, immutable classification on the source document — derived from
+	the action taken (Create Cancellation / Return / plain), never user-picked."""
+	intent = (
+		"EXACT_REVERSAL_WITH_REFERENCE" if is_cancellation
+		else "RETURN_WITH_REFERENCE" if (is_return and controller.get("return_against"))
+		else "NEW_CURRENT_STD_MOVEMENT"
+	)
+	if controller.meta.has_field("posting_intent") and controller.get("posting_intent") != intent:
+		frappe.db.set_value(controller.doctype, controller.name, "posting_intent", intent,
+			update_modified=False)
 
 
 def _pair_transfers(controller, entries):
