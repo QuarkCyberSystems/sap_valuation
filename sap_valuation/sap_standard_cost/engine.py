@@ -495,7 +495,9 @@ class StdEngine:
 			beg = self._sum("qty_adj", "period_year < %(y)s", {"y": year})
 		in_qty = out_qty = 0.0
 		for e in self.events({"period_year": year}):
-			if getdate(e.posting_date) >= ent or not flt(e.qty_adj):
+			# exclude only FUTURE postings; same-day events already in the log
+			# are part of the state being revalued
+			if getdate(e.posting_date) > ent or not flt(e.qty_adj):
 				continue
 			if e.std_trans in ("Rec", "REC (BD)", "REC (BY)", "PR"):
 				in_qty += flt(e.qty_adj)
@@ -595,8 +597,12 @@ class StdEngine:
 			frappe.throw(_("{0} is already cancelled.").format(settlement_name))
 		ent = getdate(entry_date) if entry_date else getdate(frappe.utils.nowdate())
 		ty, tm = sett.period_year, sett.period_month
-		prev_ok = (ty == ent.year and tm == ent.month - 1) or (
-			ty == ent.year - 1 and tm == 12 and ent.month == 1
+		# DR-08 is a boundary against OLD settlements: reversible while the
+		# settlement is the current or immediately-previous month; anything
+		# older takes the forward-correction path.
+		prev_ok = (
+			(ty == ent.year and tm in (ent.month, ent.month - 1))
+			or (ty == ent.year - 1 and tm == 12 and ent.month == 1)
 		)
 		if not prev_ok:
 			raise SettReverseRuleViolation(

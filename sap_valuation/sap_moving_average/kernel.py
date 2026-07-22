@@ -420,7 +420,7 @@ def _post_reconciliation(controller, scope, period, sle):
 			)
 		ipb.reval_value = r6(flt(ipb.reval_value) + residual)
 		recompute_closing(ipb)
-		_, last_ive = write_events(
+		__, last_ive = write_events(
 			scope, ipb, source=source, posting_date=posting_date,
 			movement_type=None, reason="revaluation", qty_delta=0,
 			value_delta=residual, map_before=map_before, affects_map=1,
@@ -720,7 +720,7 @@ def maybe_rounding_cleanup(controller, scope, ipb, source, posting_date):
 		ipb.reval_value = r6(flt(ipb.reval_value) - residual)
 		recompute_closing(ipb)
 		ipb.moving_avg_price = 0
-		_, ive = write_events(
+		__, ive = write_events(
 			scope, ipb, source=source, posting_date=posting_date,
 			movement_type=None, reason="rounding_cleanup", qty_delta=0,
 			value_delta=-residual, map_before=map_before,
@@ -972,7 +972,7 @@ def _post_backdated(controller, scope, prior_period, open_period, sle, is_return
 	absorb_ive = None
 	if absorb:
 		first_of_open = f"{open_period.period_year}-{open_period.period_month:02d}-01"
-		_, absorb_ive = write_events(
+		__, absorb_ive = write_events(
 			scope, ipb_cur, source=source, posting_date=first_of_open,
 			movement_type=None, reason="prd_split", qty_delta=0, value_delta=absorb,
 			map_before=flt(ipb_cur.moving_avg_price), caused_by=ive,

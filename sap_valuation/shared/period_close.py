@@ -114,6 +114,9 @@ def assert_no_orphans(period):
 		LEFT JOIN `tabGL Entry` gle ON gle.valuation_event_id = ive.name AND gle.is_cancelled = 0
 		WHERE ive.company = %s AND ive.period_year = %s AND ive.period_month = %s
 			AND ive.is_cancelled = 0 AND ive.value_delta != 0 AND gle.name IS NULL
+			-- transfers: the two legs net within (or across) inventory accounts;
+			-- GL exists only when accounts differ and is tagged to the inbound leg
+			AND ive.reason_code != 'transfer'
 		LIMIT 20
 		""",
 		(period.company, period.period_year, period.period_month),

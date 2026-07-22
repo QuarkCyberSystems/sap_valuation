@@ -88,7 +88,9 @@ class StockCount(Document):
 		)
 
 	def post_std_count(self, row):
+		from sap_valuation.sap_moving_average.kernel import ScopeState, r2, recompute_closing
 		from sap_valuation.sap_standard_cost.engine import StdEngine, get_active_standard_cost
+		from sap_valuation.shared.periods import assert_posting_allowed
 
 		engine = StdEngine(self.company, row.item_code, row.warehouse)
 		scv = get_active_standard_cost(self.company, row.item_code, row.warehouse, self.posting_date)
@@ -98,3 +100,14 @@ class StockCount(Document):
 			posting_date=self.posting_date, qty=qty, sc=flt(scv.standard_cost),
 			source=(self.doctype, self.name, row.name), cost_version=scv.name,
 		)
+		# keep the period balance in step (GL == movement table across counts)
+		period = assert_posting_allowed(self.company, self.posting_date)
+		scope = ScopeState(self.company, row.item_code, row.warehouse)
+		ipb = scope.load(period)
+		delta = flt(row.quantity_difference)
+		ipb.adjust_qty = flt(ipb.adjust_qty) + delta
+		ipb.adjust_value = r2(flt(ipb.adjust_value) + delta * flt(scv.standard_cost))
+		recompute_closing(ipb)
+		ipb.moving_avg_price = flt(scv.standard_cost)
+		ipb.period_standard_cost = flt(scv.standard_cost)
+		scope.save(ipb, source=(self.doctype, self.name))

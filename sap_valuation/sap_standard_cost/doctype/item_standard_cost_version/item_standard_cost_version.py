@@ -71,15 +71,17 @@ class ItemStandardCostVersion(Document):
 		if prior_name:
 			prior_sc = flt(frappe.db.get_value("Item Standard Cost Version", prior_name, "standard_cost"))
 
+		# supersede FIRST so a mid-period re-price (same valid-from) passes the
+		# unique-RELEASED check; the transaction rolls back together on failure
+		if prior_name:
+			frappe.db.set_value("Item Standard Cost Version", prior_name, "status", "SUPERSEDED")
+
 		self.flags.via_release_flow = True
 		self.status = "RELEASED"
 		self.supersedes_version = prior_name
 		self.released_on = now_datetime()
 		self.released_by = frappe.session.user
 		self.save(ignore_permissions=False)
-
-		if prior_name:
-			frappe.db.set_value("Item Standard Cost Version", prior_name, "status", "SUPERSEDED")
 
 		if prior_sc is not None and flt(self.standard_cost) != prior_sc:
 			self.post_revaluation_triplet(prior_sc)
@@ -111,7 +113,27 @@ class ItemStandardCostVersion(Document):
 			engine.post(trans="REV out", posting_date=today, source=source,
 				sc=self.standard_cost, ac=old_sc, t_sc_override=out_amount,
 				cost_version=self.name)
+
+		# restate the period balance: the triplet's net stock effect lands in
+		# the reval bucket so GL == movement table holds across SC changes
+		self._restate_period_balance(engine, today, delta, beg, in_qty, out_qty)
 		self.db_set("revaluation_posted", 1, update_modified=False)
+
+	def _restate_period_balance(self, engine, today, delta, beg, in_qty, out_qty):
+		from sap_valuation.sap_moving_average.kernel import ScopeState, recompute_closing
+		from sap_valuation.shared.periods import get_period
+
+		period = get_period(self.company, today)
+		if not period:
+			return
+		scope = ScopeState(self.company, self.item_code, self.warehouse)
+		ipb = scope.load(period)
+		net_stock_effect = r2(delta * (beg + in_qty - out_qty))
+		ipb.reval_value = flt(ipb.reval_value) + net_stock_effect
+		recompute_closing(ipb)
+		ipb.moving_avg_price = flt(self.standard_cost)
+		ipb.period_standard_cost = flt(self.standard_cost)
+		scope.save(ipb, source=(self.doctype, self.name))
 
 	def on_trash(self):
 		if self.status != "DRAFT":
