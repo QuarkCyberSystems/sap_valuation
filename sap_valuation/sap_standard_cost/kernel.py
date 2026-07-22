@@ -55,6 +55,13 @@ def post_via_sap_std_kernel(controller, sl_entries):
 	is_return = bool(controller.get("is_return"))
 	is_cancellation = bool(controller.get("is_cancellation"))
 
+	# DR-17 idempotency: a re-entered voucher must not double-post
+	if frappe.db.exists("Inventory Valuation Event", {
+		"source_doctype": controller.doctype, "source_docname": controller.name,
+		"is_cancelled": 0,
+	}):
+		return
+
 	entries = sorted(
 		sl_entries,
 		key=lambda s: (s.get("item_code"), s.get("warehouse") or "", str(s.get("posting_date"))),
@@ -101,7 +108,8 @@ def _post_entry(controller, sle, is_return):
 		value = r2(qty * sc)
 		_post_companion_if_needed(engine, controller, sle, trans, qty, sc, source, today)
 	elif qty < 0 and not is_return:
-		if flt(get_std_setting(company, "block_negative_stock_std") or 1):
+		block_setting = get_std_setting(company, "block_negative_stock_std")
+		if flt(1 if block_setting is None else block_setting):
 			_assert_stock_available(engine, -qty)
 		trans = "Issue (BY)" if (cross_month and cross_fy) else ("Issue (BD)" if cross_month else "Iss")
 		engine.post(trans=trans, posting_date=posting_date, qty=-qty, sc=sc,

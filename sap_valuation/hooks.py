@@ -42,6 +42,7 @@ doc_events = {
 	"Sales Invoice": _cancel_guard,
 	"Subcontracting Receipt": _cancel_guard,
 	"Landed Cost Voucher": _cancel_guard,
+	"Stock Reconciliation": _cancel_guard,
 	# No-manual-drift rule: JEs cannot hit kernel-maintained inventory accounts
 	"Journal Entry": {
 		"validate": "sap_valuation.overrides.journal_guard.block_manual_stock_journal",

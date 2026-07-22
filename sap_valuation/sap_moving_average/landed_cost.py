@@ -48,6 +48,10 @@ def handle_landed_cost(lcv):
 			title=_("Immutable Ledger"),
 		)
 
+	if lcv.get("is_cancellation"):
+		_reverse_landed_cost(lcv)
+		return True
+
 	std_rows = [row for row in routed if methods[row.name] == "SAP Standard Cost"]
 	if std_rows:
 		from sap_valuation.sap_standard_cost.kernel import handle_std_landed_cost
@@ -85,3 +89,85 @@ def handle_landed_cost(lcv):
 				offset_account=tax.expense_account,
 			)
 	return True
+
+
+def _reverse_landed_cost(lcv):
+	"""Cancellation LCV: mirror the ORIGINAL voucher's valuation events with a
+	dated GL swap — never re-run the split (B2 audit fix)."""
+	from erpnext.accounts.general_ledger import make_gl_entries
+
+	from sap_valuation.shared.immutable import KERNEL_FLAG
+
+	original = lcv.get("cancellation_against")
+	if not original:
+		frappe.throw(_("Cancellation document must reference the original via Cancellation Against."))
+	originals = frappe.get_all(
+		"Inventory Valuation Event",
+		filters={"source_doctype": "Landed Cost Voucher", "source_docname": original,
+			"is_cancelled": 0},
+		fields=["*"],
+	)
+	if not originals:
+		frappe.throw(_("No valuation events found for {0} to reverse.").format(original))
+	cost_center = frappe.get_cached_value("Company", lcv.company, "cost_center")
+
+	for orig in originals:
+		if frappe.db.exists("Inventory Valuation Event",
+				{"reversal_of": orig.name, "is_cancelled": 0}):
+			frappe.throw(_("{0} is already reversed.").format(orig.name),
+				title=_("Double Reversal Blocked"))
+		frappe.flags[KERNEL_FLAG] = True
+		try:
+			mirror = frappe.get_doc({
+				"doctype": "Inventory Valuation Event",
+				"company": orig.company, "item_code": orig.item_code,
+				"warehouse": orig.warehouse,
+				"period_year": frappe.utils.getdate(lcv.posting_date).year,
+				"period_month": frappe.utils.getdate(lcv.posting_date).month,
+				"posting_date": lcv.posting_date,
+				"entry_date": frappe.utils.now_datetime(),
+				"source_doctype": "Landed Cost Voucher", "source_docname": lcv.name,
+				"source_detail_name": orig.source_detail_name,
+				"reason_code": "cancellation", "std_trans": orig.std_trans,
+				"qty_basis": 0,
+				"value_delta": -flt(orig.value_delta),
+				"expense_portion": -flt(orig.expense_portion),
+				"total_sc": -flt(orig.total_sc or 0), "total_ac": -flt(orig.total_ac or 0),
+				"in_flag": orig.in_flag, "out_flag": orig.out_flag,
+				"ppv_with_sett": orig.ppv_with_sett,
+				"ppv_without_sett": orig.ppv_without_sett, "rev_flag": orig.rev_flag,
+				"reversal_of": orig.name,
+			}).insert(ignore_permissions=True)
+		finally:
+			frappe.flags[KERNEL_FLAG] = False
+
+		gl_map = []
+		for g in frappe.get_all("GL Entry",
+				filters={"valuation_event_id": orig.name, "is_cancelled": 0},
+				fields=["account", "debit", "credit"]):
+			gl_map.append(frappe._dict({
+				"account": g.account, "against": "",
+				"debit": flt(g.credit), "credit": flt(g.debit),
+				"debit_in_account_currency": flt(g.credit),
+				"credit_in_account_currency": flt(g.debit),
+				"posting_date": lcv.posting_date, "voucher_type": "Landed Cost Voucher",
+				"voucher_no": lcv.name, "company": lcv.company, "cost_center": cost_center,
+				"remarks": _("Exact reversal of {0}").format(orig.name),
+				"valuation_event_id": mirror.name,
+			}))
+		if gl_map:
+			make_gl_entries(gl_map, merge_entries=False)
+
+		# restore the MAP scope state the original event moved
+		if flt(orig.value_delta) and orig.reason_code == "landed_cost":
+			from sap_valuation.sap_moving_average.kernel import (
+				ScopeState, r2, recompute_closing,
+			)
+			from sap_valuation.shared.periods import assert_posting_allowed
+
+			period = assert_posting_allowed(lcv.company, lcv.posting_date)
+			scope = ScopeState(lcv.company, orig.item_code, orig.warehouse)
+			ipb = scope.load(period)
+			ipb.reval_value = r2(flt(ipb.reval_value) - flt(orig.value_delta))
+			recompute_closing(ipb)
+			scope.save(ipb, source=("Landed Cost Voucher", lcv.name))

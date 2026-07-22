@@ -339,6 +339,12 @@ class StdEngine:
 			}))
 		if gl_map:
 			make_gl_entries(gl_map, merge_entries=False)
+		# the period-close gates compare IVE.value_delta against inventory-account
+		# GL — record this event's net stock effect (B1 audit fix)
+		stock_net = sum(a2 for acct, a2 in legs if acct == a.stock)
+		if r2(stock_net):
+			frappe.db.set_value("Inventory Valuation Event", ive.name,
+				"value_delta", r2(stock_net), update_modified=False)
 
 	# ------------------------------------------------------------- rollups
 	def _sum(self, expr, cond, params):
@@ -453,10 +459,11 @@ class StdEngine:
 		return own + (flt(prior.es_qty) if prior else 0.0)
 
 	def _prior_live_settlement(self, year, month):
-		ty, tm = (year, month - 1) if month > 1 else (year - 1, 12)
+		"""Newest LIVE settlement strictly before (year, month) — scans past
+		cancelled/skipped months so the chain never silently drops (M5)."""
 		rows = [s for s in self.settlements(live_only=True)
-			if s.period_year == ty and s.period_month == tm]
-		return rows[-1] if rows else None
+			if (s.period_year, s.period_month) < (year, month)]
+		return max(rows, key=lambda s: (s.period_year, s.period_month, s.creation)) if rows else None
 
 	def pool_ppv(self, year, month, before=None):
 		if self.view == "MTD":
@@ -534,10 +541,25 @@ class StdEngine:
 		if out_qty_override is not None:
 			out_qty = out_qty_override
 		denom = beg_qty + in_qty
-		es_var = r2(var * end_qty / denom) if denom else 0.0
-		out_var = r2(var * out_qty / denom) if denom else 0.0
-		share = (end_qty / denom) if denom else 0.0
-		cons_share = (out_qty / denom) if denom else 0.0
+		if denom <= 0:
+			frappe.throw(
+				_("Nothing to settle for {0} {1}-{2:02d}: no quantity basis this period; the pool stays open.").format(
+					self.item_code, year, month
+				)
+			)
+		if end_qty <= 0:
+			# all variance belongs to consumption
+			es_var, out_var = 0.0, r2(var)
+			share, cons_share = 0.0, 1.0
+		elif end_qty >= denom:
+			# nothing consumed: all variance capitalizes
+			es_var, out_var = r2(var), 0.0
+			share, cons_share = 1.0, 0.0
+		else:
+			es_var = r2(var * end_qty / denom)
+			out_var = r2(var * out_qty / denom)
+			share = end_qty / denom
+			cons_share = out_qty / denom
 
 		frappe.flags[KERNEL_FLAG] = True
 		try:
@@ -576,7 +598,30 @@ class StdEngine:
 			{"sett_event": sett_event.name, "sett_rev_event": sett_rev_event.name},
 			update_modified=False)
 		self._stamp_ipb_settlement(sett, year, month, sc)
+		self._absorb_settlement_value(sett, year, month, es_var)
 		return frappe.get_doc("Inventory Period Settlement", sett.name)
+
+	def _absorb_settlement_value(self, sett, year, month, es_var, sign=1):
+		"""Sett debits Stock In Hand (es_var) on the period's last day and the
+		Sett-Rev credits it back on the next day 1 — mirror both into the period
+		balances so GL == movement table holds (B1 audit fix)."""
+		if not r2(es_var):
+			return
+		from sap_valuation.sap_moving_average.kernel import ScopeState, recompute_closing
+		from sap_valuation.shared.periods import get_period
+
+		ny, nm = (year + 1, 1) if month == 12 else (year, month + 1)
+		for py, pm, amount in ((year, month, sign * es_var), (ny, nm, -sign * es_var)):
+			period = get_period(self.company, f"{py}-{pm:02d}-01")
+			if not period:
+				continue
+			scope = ScopeState(self.company, self.item_code, self.physical_warehouse)
+			ipb = scope.load(period)
+			ipb.reval_value = flt(ipb.reval_value) + r2(amount)
+			recompute_closing(ipb)
+			if flt(ipb.period_standard_cost):
+				ipb.moving_avg_price = flt(ipb.period_standard_cost)
+			scope.save(ipb, source=("Inventory Period Settlement", sett.name))
 
 	def _stamp_ipb_settlement(self, sett, year, month, sc):
 		"""Reporting snapshot on the scope's Inventory Period Balance row."""
@@ -629,6 +674,7 @@ class StdEngine:
 			"cancelled": 1,
 			"reversed_by_events": f"{reverse_event.name},{rev_reverse_event.name}",
 		}, update_modified=False)
+		self._absorb_settlement_value(sett, ty, tm, flt(sett.es_var), sign=-1)
 		return reverse_event, rev_reverse_event
 
 

@@ -310,6 +310,17 @@ def post_via_sap_ma_kernel(controller, sl_entries):
 		)
 
 	company = controller.company
+	if controller.doctype == "Subcontracting Receipt":
+		frappe.throw(
+			_("Subcontracting is not supported for SAP Moving Average items in this release."),
+			title=_("Not Supported"),
+		)
+	if controller.doctype == "Stock Entry" and controller.get("add_to_transit"):
+		frappe.throw(
+			_("Stock-in-transit is not supported for SAP-valuation items in this release."),
+			title=_("Not Supported"),
+		)
+
 	is_cancellation = bool(controller.get("is_cancellation"))
 	is_return = bool(controller.get("is_return"))
 
@@ -325,6 +336,13 @@ def post_via_sap_ma_kernel(controller, sl_entries):
 			scope = ScopeState(company, sle.get("item_code"), sle.get("warehouse"))
 			period = assert_posting_allowed(company, sle.get("posting_date"))
 			_post_reconciliation(controller, scope, period, sle)
+		return
+
+	# DR-17 idempotency: a re-entered voucher must not double-post
+	if frappe.db.exists("Inventory Valuation Event", {
+		"source_doctype": controller.doctype, "source_docname": controller.name,
+		"is_cancelled": 0,
+	}):
 		return
 
 	transfer_pairs, entries = _pair_transfers(controller, entries)
@@ -576,6 +594,9 @@ def _post_current(controller, scope, period, sle, is_cancellation, is_return):
 
 	if kind == "receipt":
 		rate = flt(sle.get("incoming_rate"))
+		if controller.doctype == "Stock Entry":
+			# SE receipts offset the row/item expense chain, not GR/IR
+			srbnb = _voucher_expense_account(controller, sle) or srbnb
 		result = _apply_receipt(ipb, qty, rate)
 		sme, ive = write_events(
 			scope, ipb, source=source, posting_date=posting_date,

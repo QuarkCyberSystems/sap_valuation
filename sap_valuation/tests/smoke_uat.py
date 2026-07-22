@@ -478,7 +478,8 @@ def run_std(company, wh):
 	run_doc.submit()
 	sett = frappe.get_all("Inventory Period Settlement",
 		filters={"item_code": a, "cancelled": 0}, fields=["*"])
-	b = ipb(a)
+	# the settlement absorption seeds next month's balance row — read THIS month's
+	b = ipb_period(a, today.year, today.month)
 	tc("STD TC-C1", sett and flt(sett[0].es_var, 2) == 195 and flt(sett[0].out_var, 2) == 105
 		and flt(b.ppv_pool, 2) == 300 and b.settlement == sett[0].name,
 		f"{sett and sett[0].es_var}/{sett and sett[0].out_var}")
@@ -513,7 +514,7 @@ def run_std(company, wh):
 		"Inventory Valuation Event",
 		filters={"item_code": a, "std_trans": ("in", ["Rev Beg", "REV In", "REV out"])},
 		fields=["std_trans", "total_sc"])}
-	b = ipb(a)
+	b = ipb_period(a, today.year, today.month)
 	# in = 110 (100 + late 10) x 2 = 220; out = 35 (issue 30 + count 5) x 2 = -70
 	tc("STD TC-D1", trips.get("REV In") == 220.00 and trips.get("REV out") == -70.00
 		and flt(b.period_standard_cost) == 12
