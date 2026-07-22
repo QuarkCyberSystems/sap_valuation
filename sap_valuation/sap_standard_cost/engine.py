@@ -573,7 +573,20 @@ class StdEngine:
 		frappe.db.set_value("Inventory Period Settlement", sett.name,
 			{"sett_event": sett_event.name, "sett_rev_event": sett_rev_event.name},
 			update_modified=False)
+		self._stamp_ipb_settlement(sett, year, month, sc)
 		return frappe.get_doc("Inventory Period Settlement", sett.name)
+
+	def _stamp_ipb_settlement(self, sett, year, month, sc):
+		"""Reporting snapshot on the scope's Inventory Period Balance row."""
+		name = frappe.db.get_value("Inventory Period Balance", {
+			"company": self.company, "item_code": self.item_code,
+			"warehouse": self.warehouse or "", "period_year": year, "period_month": month,
+		})
+		if name:
+			frappe.db.set_value("Inventory Period Balance", name, {
+				"ppv_pool": flt(sett.ppv_pool), "rev_pool": flt(sett.rev_pool),
+				"settlement": sett.name, "period_standard_cost": flt(sc),
+			}, update_modified=False)
 
 	# --------------------------------------------------------- sett reverse
 	def sett_reverse(self, settlement_name, *, source, entry_date=None):

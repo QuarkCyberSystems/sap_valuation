@@ -223,6 +223,7 @@ def _write_sle_and_state(controller, engine, sle, period, qty, sc, value):
 		ipb.issue_value = r2(flt(ipb.issue_value) - value)
 	recompute_closing(ipb)
 	ipb.moving_avg_price = sc  # for STD scopes this column carries the active SC
+	ipb.period_standard_cost = sc
 	scope.save(ipb, source=(controller.doctype, controller.name))
 	write_sle(controller, sle, scope, ipb, value)
 

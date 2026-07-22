@@ -40,7 +40,13 @@
   "total_received_since_zero",
   "col_map_state",
   "is_negative",
-  "frozen_map"
+  "frozen_map",
+  "sec_std",
+  "period_standard_cost",
+  "ppv_pool",
+  "cb_std",
+  "rev_pool",
+  "settlement"
  ],
  "fields": [
   {
@@ -259,6 +265,44 @@
    "fieldtype": "Float",
    "label": "Frozen MAP",
    "precision": "6",
+   "read_only": 1
+  },
+  {
+   "collapsible": 1,
+   "fieldname": "sec_std",
+   "fieldtype": "Section Break",
+   "label": "STD State"
+  },
+  {
+   "description": "Active standard cost for STD scopes (MAP scopes leave this empty).",
+   "fieldname": "period_standard_cost",
+   "fieldtype": "Float",
+   "label": "Period Standard Cost",
+   "precision": "6",
+   "read_only": 1
+  },
+  {
+   "description": "Snapshot at last settlement of this period.",
+   "fieldname": "ppv_pool",
+   "fieldtype": "Currency",
+   "label": "PPV Pool",
+   "read_only": 1
+  },
+  {
+   "fieldname": "cb_std",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "rev_pool",
+   "fieldtype": "Currency",
+   "label": "Reval Pool",
+   "read_only": 1
+  },
+  {
+   "fieldname": "settlement",
+   "fieldtype": "Link",
+   "label": "Settlement",
+   "options": "Inventory Period Settlement",
    "read_only": 1
   }
  ],
