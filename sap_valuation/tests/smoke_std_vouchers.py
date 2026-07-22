@@ -142,6 +142,7 @@ def run(commit=False):
 	run_reversals(company, wh)
 	run_sce_isvc(company)
 	run_boundary_scv(company, wh)
+	run_year_end(company, wh)
 
 	failed = [x for x in CHECKS if not x[1]]
 	print(f"\n{len(CHECKS) - len(failed)}/{len(CHECKS)} checks passed")
@@ -355,3 +356,130 @@ def run_boundary_scv(company, wh):
 			check("frozen-target SCV refused", False, "inserted")
 		except frappe.ValidationError:
 			check("frozen-target SCV refused", True)
+
+
+def _make_std_item(item, company, view="MTD"):
+	if not frappe.db.exists("Item", item):
+		frappe.get_doc({"doctype": "Item", "item_code": item, "item_name": item,
+			"item_group": frappe.get_all("Item Group", filters={"is_group": 0}, limit=1, pluck="name")[0],
+			"stock_uom": frappe.get_all("UOM", limit=1, pluck="name")[0],
+			"is_stock_item": 1, "valuation_method": "SAP Standard Cost",
+			"settlement_view": view}).insert(ignore_permissions=True)
+
+
+def run_year_end(company, wh):
+	"""M12: Beg producer (SR opening), MTD opening in the settlement base,
+	FY gate, and STD Year End Close force-settle + identity verification."""
+	from sap_valuation.sap_standard_cost.engine import StdEngine, get_active_standard_cost
+
+	today = getdate(nowdate())
+
+	# ---- Beg producer: SR opening for a scope with no history
+	item = "_STDV-YE"
+	_make_std_item(item, company)
+	scv = frappe.get_doc({"doctype": "Item Standard Cost Version", "company": company,
+		"item_code": item, "valid_from_year": today.year, "valid_from_month": today.month,
+		"standard_cost": 12, "source_type": "MANUAL_OVERRIDE"})
+	scv.insert(ignore_permissions=True)
+	scv.release()
+
+	tsa = frappe.get_all("Account", filters={"company": company, "is_group": 0,
+		"account_type": "Temporary"}, limit=1, pluck="name")
+	opening_acct = tsa[0] if tsa else frappe.get_all("Account",
+		filters={"company": company, "is_group": 0, "root_type": "Liability"}, limit=1, pluck="name")[0]
+	sr = frappe.get_doc({
+		"doctype": "Stock Reconciliation", "company": company, "purpose": "Opening Stock",
+		"posting_date": nowdate(), "set_posting_time": 1, "expense_account": opening_acct,
+		"items": [{"item_code": item, "warehouse": wh, "qty": 100, "valuation_rate": 15}],
+	})
+	sr.insert(ignore_permissions=True)
+	sr.submit()
+
+	beg = frappe.get_all("Inventory Valuation Event",
+		filters={"item_code": item, "std_trans": "Beg"},
+		fields=["total_sc", "total_ac", "qty_adj"])
+	check("SR opening posts Beg (100 qty, SC 1200 / AC 1500)",
+		len(beg) == 1 and flt(beg[0].qty_adj) == 100 and flt(beg[0].total_sc) == 1200
+		and flt(beg[0].total_ac) == 1500, str(beg))
+	gl = frappe.get_all("GL Entry", filters={"voucher_no": sr.name, "is_cancelled": 0},
+		fields=["account", "debit", "credit"])
+	fy_acct = frappe.db.get_value("SAP Standard Cost Settings", {"company": company},
+		"fy_carry_forward_account")
+	carry = [g for g in gl if g.account == fy_acct]
+	check("Beg GL: balanced, Cr FY Carry Forward 1500",
+		flt(sum(g.debit for g in gl), 2) == flt(sum(g.credit for g in gl), 2) == 1500
+		and carry and flt(carry[0].credit) == 1500, str(gl))
+
+	try:
+		sr2 = frappe.get_doc({
+			"doctype": "Stock Reconciliation", "company": company, "purpose": "Stock Reconciliation",
+			"posting_date": nowdate(), "set_posting_time": 1, "expense_account": opening_acct,
+			"items": [{"item_code": item, "warehouse": wh, "qty": 90, "valuation_rate": 15}],
+		})
+		sr2.insert(ignore_permissions=True)
+		sr2.submit()
+		check("second SR blocked (opening only)", False, "submitted")
+	except frappe.ValidationError:
+		check("second SR blocked (opening only)", True)
+
+	# ---- MTD settlement base includes the opening quantity
+	make_pr(item, wh, 50, 14)          # Rec: PPV 100 -> pool 400
+	make_dn(item, wh, 30)              # Iss at SC -> end 120
+	engine = StdEngine(company, item, wh)
+	sett = engine.close_period(year=today.year, month=today.month, sc=12,
+		source=("Stock Reconciliation", sr.name))
+	check("go-live month base includes Beg (es 320 / out 80)",
+		flt(sett.es_var, 2) == 320 and flt(sett.out_var, 2) == 80,
+		f"{sett.es_var}/{sett.out_var}")
+
+	# ---- FY gate + Year End Close
+	item2 = "_STDV-YE2"
+	_make_std_item(item2, company)
+	scv2 = frappe.get_doc({"doctype": "Item Standard Cost Version", "company": company,
+		"item_code": item2, "valid_from_year": 2025, "valid_from_month": 12,
+		"standard_cost": 12, "source_type": "MANUAL_OVERRIDE"})
+	scv2.insert(ignore_permissions=True)
+	scv2.release()
+	e2 = StdEngine(company, item2, wh)
+	e2.post(trans="Rec", posting_date="2025-12-10", qty=100, sc=12, ac=15,
+		source=("Stock Reconciliation", sr.name))
+
+	try:
+		e2.close_period(year=today.year, month=today.month, sc=12,
+			source=("Stock Reconciliation", sr.name))
+		check("FY gate blocks new-year settlement", False, "settled")
+	except frappe.ValidationError as e:
+		check("FY gate blocks new-year settlement", "Year End" in str(e), str(e)[:100])
+
+	try:
+		frappe.get_doc({"doctype": "STD Year End Close", "company": company,
+			"fiscal_year": today.year}).insert(ignore_permissions=True)
+		check("YEC refuses unfinished fiscal year", False, "inserted")
+	except frappe.ValidationError:
+		check("YEC refuses unfinished fiscal year", True)
+
+	yec = frappe.get_doc({"doctype": "STD Year End Close", "company": company,
+		"fiscal_year": 2025})
+	yec.insert(ignore_permissions=True)
+	yec.submit()
+	check("YEC completes: Dec 2025 force-settled + verified",
+		yec.status == "Completed" and yec.scopes_settled >= 1
+		and yec.scopes_verified == yec.scopes_total,
+		f"{yec.status} {yec.scopes_settled}/{yec.scopes_total}")
+
+	dec = frappe.get_all("Inventory Period Settlement",
+		filters={"item_code": item2, "period_year": 2025, "period_month": 12, "cancelled": 0},
+		fields=["es_var", "out_var", "variance"])
+	check("Dec 2025 settle: all-ES 300 (end >= base)",
+		dec and flt(dec[0].es_var, 2) == 300 and flt(dec[0].out_var, 2) == 0, str(dec))
+	srv = frappe.get_all("Inventory Valuation Event",
+		filters={"item_code": item2, "std_trans": "Sett - Rev"},
+		fields=["posting_date", "total_sc"])
+	check("cross-FY Sett-Rev lands Jan 1 (inventory-share -300)",
+		srv and str(srv[0].posting_date) == "2026-01-01" and flt(srv[0].total_sc, 2) == -300,
+		str(srv))
+
+	sett2 = e2.close_period(year=today.year, month=today.month, sc=12,
+		source=("Stock Reconciliation", sr.name))
+	check("new-year settlement passes gate, carry re-settles (var 300)",
+		flt(sett2.variance, 2) == 300, f"{sett2.variance}")

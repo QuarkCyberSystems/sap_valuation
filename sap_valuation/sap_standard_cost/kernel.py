@@ -43,15 +43,6 @@ def post_via_sap_std_kernel(controller, sl_entries):
 			_("Subcontracting is not supported for SAP Standard Cost items in this release."),
 			title=_("Not Supported"),
 		)
-	if controller.doctype == "Stock Reconciliation":
-		frappe.throw(
-			_(
-				"Stock Reconciliation is not yet enabled for SAP Standard Cost items. "
-				"Use Stock Count (quantity) or release a new cost version (value)."
-			),
-			title=_("Not Supported"),
-		)
-
 	is_return = bool(controller.get("is_return"))
 	is_cancellation = bool(controller.get("is_cancellation"))
 
@@ -65,6 +56,11 @@ def post_via_sap_std_kernel(controller, sl_entries):
 	from sap_valuation.sap_moving_average.kernel import _stamp_document_intent
 
 	_stamp_document_intent(controller, is_cancellation, is_return)
+
+	if controller.doctype == "Stock Reconciliation":
+		for sle in sl_entries:
+			_post_opening_std(controller, sle)
+		return
 
 	entries = sorted(
 		sl_entries,
@@ -133,6 +129,45 @@ def _post_entry(controller, sle, is_return):
 		value = r2(qty * sc)
 
 	_write_sle_and_state(controller, engine, sle, period, qty, sc, value)
+
+
+def _post_opening_std(controller, sle):
+	"""Beg producer (M12): Stock Reconciliation is the go-live opening lever
+	for a scope with NO valuation history. Per the workbook's Beg row: qty at
+	the active standard cost, opening variance (AC - SC) into both PPV pools,
+	offset FY Carry Forward (DR-06). All later corrections stay blocked —
+	Stock Count moves quantity, a cost version release moves value."""
+	company = controller.company
+	item_code = sle.get("item_code")
+	posting_date = getdate(sle.get("posting_date"))
+	period = assert_posting_allowed(company, posting_date)
+	engine = StdEngine(company, item_code, sle.get("warehouse"))
+
+	if engine.events():
+		frappe.throw(
+			_(
+				"Stock Reconciliation for SAP Standard Cost items is limited to the opening "
+				"entry of a scope with no valuation history. Use Stock Count (quantity) or "
+				"release a new cost version (value) for corrections."
+			),
+			title=_("Not Supported"),
+		)
+
+	target_qty = flt(
+		sle.get("qty_after_transaction")
+		if sle.get("qty_after_transaction") is not None
+		else sle.get("actual_qty")
+	)
+	if target_qty <= 0:
+		frappe.throw(_("Opening quantity must be positive for {0}.").format(item_code))
+
+	scv = get_active_standard_cost(company, item_code, sle.get("warehouse"), posting_date)
+	sc = flt(scv.standard_cost)
+	ac = flt(sle.get("valuation_rate")) if sle.get("valuation_rate") not in (None, "") else sc
+	source = (controller.doctype, controller.name, sle.get("voucher_detail_no"))
+	engine.post(trans="Beg", posting_date=posting_date, qty=target_qty, sc=sc, ac=ac,
+		source=source, cost_version=scv.name)
+	_write_sle_and_state(controller, engine, sle, period, target_qty, sc, r2(target_qty * sc))
 
 
 def _post_cancellation_std(controller, engine, sle, period):

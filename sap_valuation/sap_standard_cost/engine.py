@@ -401,17 +401,22 @@ class StdEngine:
 		)
 		return sorted((int(y), int(m)) for y, m in rows)
 
-	# ---- MTD rollups (month-scoped, Beg chains from prior period's End)
+	# ---- MTD rollups (month-scoped, Beg chains from prior period's End).
+	# Beg opening events belong to the month's BEGINNING bucket so the go-live
+	# month's settlement base (beg + in) includes the opening quantity.
 	def beg_qty_mtd(self, year, month):
 		prior = [p for p in self._periods_present() if p < (year, month)]
-		if not prior:
-			return 0.0
-		py, pm = prior[-1]
-		return self.end_qty_mtd(py, pm)
+		base = self.end_qty_mtd(*prior[-1]) if prior else 0.0
+		return base + self._sum(
+			"qty_adj", "period_year = %(y)s AND period_month = %(m)s AND std_trans = 'Beg'",
+			{"y": year, "m": month},
+		)
 
 	def end_qty_mtd(self, year, month):
 		return self.beg_qty_mtd(year, month) + self._sum(
-			"qty_adj", "period_year = %(y)s AND period_month = %(m)s", {"y": year, "m": month}
+			"qty_adj",
+			"period_year = %(y)s AND period_month = %(m)s AND std_trans != 'Beg'",
+			{"y": year, "m": month},
 		)
 
 	def in_qty_mtd(self, year, month, before=None):
@@ -547,8 +552,28 @@ class StdEngine:
 		return {"Rev Beg": beg, "REV In": in_qty, "REV out": out_qty}.get(trans, 0.0)
 
 	# --------------------------------------------------------- close period
+	def _assert_prior_fy_closed(self, year):
+		"""Year-end gate: a new fiscal year may not settle while the prior
+		year's December is live-unsettled with stock or an open pool — the
+		carry (inventory-share Sett-Rev on Jan 1) would silently never seed."""
+		prev = year - 1
+		if not any(p[0] == prev for p in self._periods_present()):
+			return
+		if self.is_period_locked(prev, 12):
+			return
+		if self.end_qty_mtd(prev, 12) > 0 or flt(self.pool_ppv(prev, 12)) \
+				or flt(self.pool_rev(prev, 12)):
+			frappe.throw(
+				_(
+					"Fiscal year {0} is not closed for {1}: December {0} is unsettled with "
+					"stock or an open variance pool. Run STD Year End Close for {0} first."
+				).format(prev, self.item_code),
+				title=_("Year End Open"),
+			)
+
 	def close_period(self, *, year, month, sc, source, entry_date=None, ref=None,
 			es_qty_override=None, out_qty_override=None, settlement_run=None):
+		self._assert_prior_fy_closed(year)
 		before = now_datetime()
 		if self.view == "MTD":
 			beg_qty = self.beg_qty_mtd(year, month)
