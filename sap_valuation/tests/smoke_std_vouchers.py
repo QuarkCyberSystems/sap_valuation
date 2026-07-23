@@ -256,6 +256,7 @@ def run_sce_isvc(company):
 	sce.insert(ignore_permissions=True)
 	sce.calculate()
 	check("SCE roll-up 5x4 +10% = 22", flt(sce.standard_cost, 2) == 22.00, sce.standard_cost)
+	sce.mark()
 	scv_name = sce.release()
 	scv = frappe.get_doc("Item Standard Cost Version", scv_name)
 	check("SCE release creates RELEASED SCV (source SCE)",

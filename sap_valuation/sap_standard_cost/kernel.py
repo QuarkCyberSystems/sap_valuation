@@ -92,8 +92,7 @@ def _post_entry(controller, sle, is_return):
 		return
 
 	today = getdate(frappe.utils.nowdate())
-	cross_month = (posting_date.year, posting_date.month) != (today.year, today.month)
-	cross_fy = posting_date.year != today.year
+	cross_month, cross_fy = _backdate_class(engine, posting_date, today)
 
 	scv = get_active_standard_cost(company, item_code, sle.get("warehouse"), posting_date)
 	sc = flt(scv.standard_cost)
@@ -128,7 +127,7 @@ def _post_entry(controller, sle, is_return):
 			source=source, cost_version=scv.name)
 		value = r2(qty * sc)
 
-	_write_sle_and_state(controller, engine, sle, period, qty, sc, value)
+	_write_sle_and_state(controller, engine, sle, period, qty, sc, value, scv_name=scv.name)
 
 
 def _post_opening_std(controller, sle):
@@ -167,7 +166,7 @@ def _post_opening_std(controller, sle):
 	source = (controller.doctype, controller.name, sle.get("voucher_detail_no"))
 	engine.post(trans="Beg", posting_date=posting_date, qty=target_qty, sc=sc, ac=ac,
 		source=source, cost_version=scv.name)
-	_write_sle_and_state(controller, engine, sle, period, target_qty, sc, r2(target_qty * sc))
+	_write_sle_and_state(controller, engine, sle, period, target_qty, sc, r2(target_qty * sc), scv_name=scv.name)
 
 
 def _post_cancellation_std(controller, engine, sle, period):
@@ -218,6 +217,45 @@ def _post_cancellation_std(controller, engine, sle, period):
 	write_sle(controller, mirrored, scope, ipb, value)
 
 
+def _backdate_class(engine, posting_date, today):
+	"""DR-09 label rules (m11): decide whether a backdated posting carries a
+	(BD)/(BY) label or posts plain.
+
+	- Post-reopen late entries post PLAIN: the target period was settled and
+	  Sett-Reversed, so the coming re-settlement absorbs them — no bridge.
+	- (BY) exists only inside the prior-FY soft-close window: the immediately
+	  previous fiscal year, before its December is live-settled. Outside the
+	  window the backdate is refused (post a current-dated correction).
+	"""
+	cross_month = (posting_date.year, posting_date.month) != (today.year, today.month)
+	if not cross_month:
+		return False, False
+
+	# reopened period: a cancelled settlement exists and no live one
+	reopened = not engine.is_period_locked(posting_date.year, posting_date.month) \
+		and frappe.db.exists("Inventory Period Settlement", {
+			"company": engine.company, "item_code": engine.item_code,
+			"warehouse": engine.warehouse or "",
+			"period_year": posting_date.year, "period_month": posting_date.month,
+			"cancelled": 1,
+		})
+	if reopened:
+		return False, False
+
+	cross_fy = posting_date.year != today.year
+	if cross_fy:
+		if posting_date.year != today.year - 1 or engine.is_period_locked(today.year - 1, 12):
+			frappe.throw(
+				_(
+					"Backdating into {0} is outside the prior-year soft-close window "
+					"((BY) covers only the previous fiscal year before its December is "
+					"settled). Post a current-dated correction instead."
+				).format(posting_date),
+				title=_("Backdate Window Closed"),
+			)
+	return cross_month, cross_fy
+
+
 def _post_companion_if_needed(engine, controller, sle, trans, qty, sc_original, source, today):
 	"""Cross-month/FY backdate companion: bridges qty x (current SC - original SC)
 	in the current period (audit-only when the SC is unchanged)."""
@@ -230,8 +268,8 @@ def _post_companion_if_needed(engine, controller, sle, trans, qty, sc_original, 
 	companion_value = r2(qty * delta)
 	if trans.startswith("Issue"):
 		companion_value = -companion_value
-	if not companion_value:
-		return
+	# zero-delta companions still post (simulators' zero-bridging rows): the
+	# audit chain must show the bridge was evaluated, not skipped
 	engine.post(
 		trans=f"{trans} - Rev", posting_date=today, qty=qty,
 		sc=current.standard_cost, source=source, ref=source[1],
@@ -256,7 +294,7 @@ def _assert_stock_available(engine, qty_needed):
 		)
 
 
-def _write_sle_and_state(controller, engine, sle, period, qty, sc, value):
+def _write_sle_and_state(controller, engine, sle, period, qty, sc, value, scv_name=None):
 	"""SLE-compatible row + Bin + Inventory Period Balance at standard cost."""
 	from sap_valuation.sap_moving_average.kernel import ScopeState, recompute_closing, write_sle
 
@@ -271,6 +309,9 @@ def _write_sle_and_state(controller, engine, sle, period, qty, sc, value):
 	recompute_closing(ipb)
 	ipb.moving_avg_price = sc  # for STD scopes this column carries the active SC
 	ipb.period_standard_cost = sc
+	ipb.resolved_settlement_view = engine.view
+	ipb.active_cost_version = scv_name
+	ipb.closing_reference_value = r2(flt(ipb.closing_qty) * flt(sc))
 	scope.save(ipb, source=(controller.doctype, controller.name))
 	write_sle(controller, sle, scope, ipb, value)
 

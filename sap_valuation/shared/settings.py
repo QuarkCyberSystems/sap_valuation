@@ -16,8 +16,6 @@ _DEFAULTS = {
 	"negative_stock_allowed": 0,
 	"default_return_valuation": "With Reference",
 	"enable_period_balance_audit_log": 0,
-	"currency_precision": 2,
-	"internal_precision": 6,
 	"rounding_tolerance": 0.01,
 	"reconciliation_tolerance": 0.0,
 }

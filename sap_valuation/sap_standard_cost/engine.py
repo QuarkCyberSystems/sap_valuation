@@ -252,7 +252,8 @@ class StdEngine:
 				"source_doctype": source[0],
 				"source_docname": source[1],
 				"source_detail_name": source[2] if len(source) > 2 else None,
-				"reason_code": "settlement" if trans in SETT_FAMILY else "std_event",
+				"reason_code": ("settlement_reverse" if "Rev" in trans else "settlement")
+					if trans in SETT_FAMILY else "std_event",
 				"posting_intent": posting_intent or _derive_std_intent(trans, reversal_of),
 				"std_trans": trans,
 				"qty_adj": qty_adj,
@@ -687,9 +688,14 @@ class StdEngine:
 			"warehouse": self.warehouse or "", "period_year": year, "period_month": month,
 		})
 		if name:
+			closing_qty = flt(frappe.db.get_value("Inventory Period Balance", name, "closing_qty"))
 			frappe.db.set_value("Inventory Period Balance", name, {
 				"ppv_pool": flt(sett.ppv_pool), "rev_pool": flt(sett.rev_pool),
 				"settlement": sett.name, "period_standard_cost": flt(sc),
+				"resolved_settlement_view": self.view,
+				"settlement_inventory_total": r2(sett.es_var),
+				"settlement_consumption_total": r2(sett.out_var),
+				"closing_reference_value": r2(closing_qty * flt(sc)),
 			}, update_modified=False)
 
 	# --------------------------------------------------------- sett reverse

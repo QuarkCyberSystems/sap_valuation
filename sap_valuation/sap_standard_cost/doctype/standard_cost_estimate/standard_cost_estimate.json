@@ -14,6 +14,8 @@
   "valid_from_year",
   "valid_from_month",
   "status",
+  "marked_by",
+  "marked_on",
   "sec2",
   "components",
   "sec3",
@@ -71,7 +73,20 @@
    "fieldtype": "Select",
    "in_list_view": 1,
    "label": "Status",
-   "options": "DRAFT\nCALCULATED\nRELEASED",
+   "options": "DRAFT\nCALCULATED\nMARKED\nRELEASED\nSUPERSEDED",
+   "read_only": 1
+  },
+  {
+   "fieldname": "marked_by",
+   "fieldtype": "Link",
+   "label": "Marked By",
+   "options": "User",
+   "read_only": 1
+  },
+  {
+   "fieldname": "marked_on",
+   "fieldtype": "Datetime",
+   "label": "Marked On",
    "read_only": 1
   },
   {

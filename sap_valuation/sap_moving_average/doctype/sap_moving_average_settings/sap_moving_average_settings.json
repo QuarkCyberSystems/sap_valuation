@@ -24,8 +24,6 @@
   "col_behavior",
   "enable_period_balance_audit_log",
   "sec_precision",
-  "currency_precision",
-  "internal_precision",
   "col_precision",
   "rounding_tolerance",
   "reconciliation_tolerance"
@@ -128,18 +126,6 @@
    "fieldname": "sec_precision",
    "fieldtype": "Section Break",
    "label": "Precision & Tolerances"
-  },
-  {
-   "default": "2",
-   "fieldname": "currency_precision",
-   "fieldtype": "Int",
-   "label": "Currency Precision"
-  },
-  {
-   "default": "6",
-   "fieldname": "internal_precision",
-   "fieldtype": "Int",
-   "label": "Internal Precision"
   },
   {
    "fieldname": "col_precision",

@@ -20,7 +20,8 @@
   "default_settlement_view",
   "block_negative_stock_std",
   "cb2",
-  "view_default_locked"
+  "view_default_locked",
+  "mark_release_separation_required"
  ],
  "fields": [
   {
@@ -104,6 +105,13 @@
    "fieldtype": "Check",
    "label": "Default View Locked",
    "read_only": 1
+  },
+  {
+   "fieldname": "mark_release_separation_required",
+   "fieldtype": "Check",
+   "label": "Mark/Release Separation Required",
+   "default": "0",
+   "description": "When ON, the user who Marked a Standard Cost Estimate cannot also Release it (segregation of duties)."
   }
  ],
  "idx": 0,

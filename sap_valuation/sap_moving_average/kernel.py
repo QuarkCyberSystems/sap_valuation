@@ -176,10 +176,17 @@ def _derive_intent(reason):
 	return "NEW_CURRENT_STD_MOVEMENT"
 
 
+def _receipt_fx(controller):
+	"""FX traceability (m1/DR-26): stamp the document conversion rate on
+	receipt events so the IFRS split never depends on a runtime join."""
+	rate = flt(controller.get("conversion_rate"))
+	return rate if rate and rate != 1 else None
+
+
 def write_events(scope, ipb, *, source, posting_date, movement_type, reason, qty_delta,
 		value_delta, map_before, prd_amount=0, inventory_portion=0, expense_portion=0,
 		fx_variance=0, reference_event=None, reversal_of=None, movement_reversal_of=None,
-		caused_by=None, affects_map=0, stock_uom=None):
+		caused_by=None, affects_map=0, stock_uom=None, exchange_rate_at_receipt=None):
 	"""Insert the SME (when qty moves) + IVE pair; returns (sme_name, ive_name)."""
 	d = getdate(posting_date)
 	frappe.flags[KERNEL_FLAG] = True
@@ -228,6 +235,7 @@ def write_events(scope, ipb, *, source, posting_date, movement_type, reason, qty
 				"expense_portion": r2(expense_portion),
 				"prd_amount": r2(prd_amount),
 				"fx_variance": r2(fx_variance),
+				"exchange_rate_at_receipt": exchange_rate_at_receipt,
 				"affects_map": affects_map,
 				"map_before": map_before,
 				"map_after": ipb.moving_avg_price,
@@ -631,6 +639,7 @@ def _post_current(controller, scope, period, sle, is_cancellation, is_return):
 			movement_type="receipt", reason=result["reason"], qty_delta=qty,
 			value_delta=result["net_to_inventory"], map_before=map_before,
 			prd_amount=result["prd"], affects_map=1, stock_uom=sle.get("stock_uom"),
+			exchange_rate_at_receipt=_receipt_fx(controller),
 		)
 		legs = [
 			(inventory_account, result["receipt_value"], srbnb),
@@ -765,7 +774,7 @@ def maybe_rounding_cleanup(controller, scope, ipb, source, posting_date):
 	residual = r2(flt(ipb.closing_value))
 	tolerance = flt(get_sap_ma_setting(scope.company, "rounding_tolerance")) or 0.01
 	map_before = flt(ipb.moving_avg_price)
-	if residual and abs(residual) <= tolerance * 100:
+	if residual and abs(residual) <= tolerance:
 		ipb.reval_value = r6(flt(ipb.reval_value) - residual)
 		recompute_closing(ipb)
 		ipb.moving_avg_price = 0
@@ -977,6 +986,7 @@ def _post_backdated(controller, scope, prior_period, open_period, sle, is_return
 		movement_type="receipt", reason=result["reason"], qty_delta=qty,
 		value_delta=result["net_to_inventory"], map_before=map_before_prior,
 		prd_amount=result["prd"], affects_map=1, stock_uom=sle.get("stock_uom"),
+		exchange_rate_at_receipt=_receipt_fx(controller),
 	)
 	scope.save(ipb_prior, caused_by=ive, movement_event=sme, source=source)
 

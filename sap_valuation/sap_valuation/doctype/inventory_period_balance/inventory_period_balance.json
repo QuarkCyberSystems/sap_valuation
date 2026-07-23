@@ -46,7 +46,12 @@
   "ppv_pool",
   "cb_std",
   "rev_pool",
-  "settlement"
+  "settlement",
+  "active_cost_version",
+  "resolved_settlement_view",
+  "settlement_inventory_total",
+  "settlement_consumption_total",
+  "closing_reference_value"
  ],
  "fields": [
   {
@@ -304,6 +309,41 @@
    "label": "Settlement",
    "options": "Inventory Period Settlement",
    "read_only": 1
+  },
+  {
+   "fieldname": "active_cost_version",
+   "fieldtype": "Link",
+   "label": "Active Cost Version",
+   "options": "Item Standard Cost Version",
+   "read_only": 1
+  },
+  {
+   "fieldname": "resolved_settlement_view",
+   "fieldtype": "Select",
+   "label": "Resolved Settlement View",
+   "options": "\nMTD\nYTD",
+   "read_only": 1
+  },
+  {
+   "fieldname": "settlement_inventory_total",
+   "fieldtype": "Currency",
+   "label": "Settlement Inventory Total",
+   "read_only": 1,
+   "description": "es_var settled into ending stock for this period"
+  },
+  {
+   "fieldname": "settlement_consumption_total",
+   "fieldtype": "Currency",
+   "label": "Settlement Consumption Total",
+   "read_only": 1,
+   "description": "out_var settled to consumption for this period"
+  },
+  {
+   "fieldname": "closing_reference_value",
+   "fieldtype": "Currency",
+   "label": "Closing Reference Value",
+   "read_only": 1,
+   "description": "closing_qty x period standard cost (STD scopes)"
   }
  ],
  "idx": 0,

@@ -555,6 +555,7 @@ def run_std(company, wh):
 		"components": [{"item_code": comp, "qty": 5, "rate_source": "LEAF_STD"}]})
 	sce.insert(ignore_permissions=True)
 	sce.calculate()
+	sce.mark()
 	scv_name = sce.release()
 	scv_fg = frappe.get_doc("Item Standard Cost Version", scv_name)
 	tc("STD TC-E1", flt(sce.standard_cost, 2) == 22 and scv_fg.status == "RELEASED"
