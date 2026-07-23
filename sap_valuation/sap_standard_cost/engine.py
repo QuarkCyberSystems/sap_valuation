@@ -322,8 +322,14 @@ class StdEngine:
 			# t_sc convention: -(delta x out_qty). SC increase (delta>0) -> s<0 ->
 			# Dr COGS Adjustment / Cr Stock; SC decrease flips both legs.
 			return [(a.cogs_adj, -s), (a.stock, s)]
-		if trans in ("Issue (BD) - Rev", "Issue (BY) - Rev"):
-			return [(a.cogs_adj, -s), (a.reserve, s)]
+		if trans == "Issue (BD) - Rev":
+			# same-FY: consumption tops up at current SC and inventory gives
+			# back the triplet's overshoot on the departed units (workbooks:
+			# MTD r26, YTD issue-backdated r34 — COGS <-> Inventory)
+			return [(a.cogs_adj, -s), (a.stock, s)]
+		if trans == "Issue (BY) - Rev":
+			# cross-FY: prior-FY COGS is closed — Inventory <-> Reserve
+			return [(a.reserve, -s), (a.stock, s)]
 		if settlement is not None:
 			es, out = flt(settlement.es_var), flt(settlement.out_var)
 			ppv, rev = flt(settlement.ppv_pool), flt(settlement.rev_pool)
@@ -332,8 +338,14 @@ class StdEngine:
 			if trans == "Sett":
 				return [(a.stock, es), (a.cogs_adj, out), (a.ppv, -ppv), (a.reserve, -rev)]
 			if trans == "Sett - Rev":
-				if xfy:
-					return [(a.stock, -es), (a.ppv, ppv_es), (a.reserve, rev_es)]
+				# the carryover mirrors what the view's chain re-imports:
+				# MTD re-imports the inventory share only (workbook v2.05 r19),
+				# YTD same-FY re-imports the full pool -> full 4-leg mirror;
+				# cross-FY is inventory-share only in both views (DR-06)
+				if xfy or self.view == "MTD":
+					# reserve leg balances: ppv_es/rev_es are rounded shares
+					# and must sum exactly to es_var for a zero-sum row
+					return [(a.stock, -es), (a.ppv, ppv_es), (a.reserve, r2(es - ppv_es))]
 				return [(a.stock, -es), (a.cogs_adj, -out), (a.ppv, ppv), (a.reserve, rev)]
 			if trans == "Sett - Reverse":
 				return [(a.stock, -es), (a.cogs_adj, -out), (a.ppv, ppv), (a.reserve, rev)]
@@ -526,12 +538,32 @@ class StdEngine:
 		return own + (flt(prior.rev_pool) if prior.period_year == year else flt(prior.rev_es))
 
 	def _prior_live_settlement_mtd(self, year, month):
+		"""MTD carry is ADJACENT-month only: the Sett-Rev lands on day 1 of the
+		month after the settled one, so its inventory share belongs to THAT
+		month's pool. A later month re-imports nothing until its own previous
+		month settles (workbook v2.05: Apr pool = own 400, Feb's carry stays
+		in unsettled March)."""
+		py, pm = (year - 1, 12) if month == 1 else (year, month - 1)
 		rows = [s for s in self.settlements(live_only=True)
-			if (s.period_year, s.period_month) < (year, month)]
-		return max(rows, key=lambda s: (s.period_year, s.period_month, s.creation)) if rows else None
+			if (s.period_year, s.period_month) == (py, pm)]
+		return max(rows, key=lambda s: s.creation) if rows else None
 
 	# ---- reval qty categorization (drift guard, client-verified)
 	def _reval_qty_at(self, trans, ent, *, sc_new, sc_old):
+		if self.view == "MTD":
+			# DR-12: MTD reval buckets are MONTH-scoped — Beg = prior month's
+			# end (+ any Beg openings), In/Out = month-to-date at the moment
+			beg = self.beg_qty_mtd(ent.year, ent.month)
+			in_qty = out_qty = 0.0
+			for e in self.events({"period_year": ent.year, "period_month": ent.month}):
+				if getdate(e.posting_date) > ent or not flt(e.qty_adj):
+					continue
+				if e.std_trans in ("Rec", "REC (BD)", "REC (BY)", "PR"):
+					in_qty += flt(e.qty_adj)
+				elif e.std_trans in ("Iss", "Issue (BD)", "Issue (BY)", "SC-", "SR", "SC+"):
+					out_qty += -flt(e.qty_adj)
+			return {"Rev Beg": beg, "REV In": in_qty, "REV out": out_qty}.get(trans, 0.0)
+
 		year = ent.year
 		beg_events = [e for e in self._beg_events(year) if getdate(e.posting_date) <= ent]
 		if beg_events:
@@ -668,6 +700,8 @@ class StdEngine:
 		from sap_valuation.sap_moving_average.kernel import ScopeState, recompute_closing
 		from sap_valuation.shared.periods import get_period
 
+		from sap_valuation.sap_standard_cost.kernel import _cascade_backdated_ipb
+
 		ny, nm = (year + 1, 1) if month == 12 else (year, month + 1)
 		for py, pm, amount in ((year, month, sign * es_var), (ny, nm, -sign * es_var)):
 			period = get_period(self.company, f"{py}-{pm:02d}-01")
@@ -677,6 +711,7 @@ class StdEngine:
 			ipb = scope.load(period)
 			ipb.reval_value = flt(ipb.reval_value) + r2(amount)
 			recompute_closing(ipb)
+			_cascade_backdated_ipb(scope, period, 0, r2(amount), source=("Inventory Period Settlement", sett.name))
 			if flt(ipb.period_standard_cost):
 				ipb.moving_avg_price = flt(ipb.period_standard_cost)
 			scope.save(ipb, source=("Inventory Period Settlement", sett.name))

@@ -116,14 +116,20 @@ def _post_entry(controller, sle, is_return):
 		value = r2(qty * sc)
 		_post_companion_if_needed(engine, controller, sle, trans, -qty, sc, source, today)
 	elif is_return and qty < 0:
-		# purchase return (PR intent): at the ORIGINAL receipt's standard cost
+		# purchase return (PR intent): stock leg at SC; AC = the returned row's
+		# actual rate (sle.incoming_rate is 0 for outgoing returns), so the
+		# PPV pool gives back the original variance (workbook PR row)
 		ac = flt(sle.get("incoming_rate"))
+		if not ac:
+			row = next((x for x in controller.get("items") or []
+				if x.name == sle.get("voucher_detail_no")), None)
+			ac = flt(row.base_net_rate) if row else 0.0
 		engine.post(trans="PR", posting_date=posting_date, qty=-qty, sc=sc, ac=ac,
 			source=source, cost_version=scv.name)
 		value = r2(qty * sc)
 	else:
 		# sales return (SR intent): new movement at posting-date STD (phase-1 rule)
-		engine.post(trans="SR", posting_date=posting_date, qty=qty, sc=sc,
+		engine.post(trans="SR", posting_date=posting_date, qty=qty, sc=sc, ac=sc,
 			source=source, cost_version=scv.name)
 		value = r2(qty * sc)
 
@@ -275,6 +281,21 @@ def _post_companion_if_needed(engine, controller, sle, trans, qty, sc_original, 
 		sc=current.standard_cost, source=source, ref=source[1],
 		t_sc_override=companion_value, cost_version=current.name,
 	)
+	if companion_value:
+		# the companion's stock leg must land in today's balance too, or the
+		# GL == movement-table identity breaks at period close
+		from sap_valuation.sap_moving_average.kernel import ScopeState, recompute_closing
+		from sap_valuation.shared.periods import get_period
+
+		period = get_period(engine.company, today)
+		if period:
+			scope = ScopeState(engine.company, engine.item_code, engine.physical_warehouse)
+			ipb = scope.load(period)
+			ipb.reval_value = flt(ipb.reval_value) + companion_value
+			recompute_closing(ipb)
+			if flt(ipb.period_standard_cost):
+				ipb.closing_reference_value = r2(flt(ipb.closing_qty) * flt(ipb.period_standard_cost))
+			scope.save(ipb, source=source)
 
 
 def _assert_stock_available(engine, qty_needed):
@@ -313,7 +334,35 @@ def _write_sle_and_state(controller, engine, sle, period, qty, sc, value, scv_na
 	ipb.active_cost_version = scv_name
 	ipb.closing_reference_value = r2(flt(ipb.closing_qty) * flt(sc))
 	scope.save(ipb, source=(controller.doctype, controller.name))
+	_cascade_backdated_ipb(scope, period, qty, value, source=(controller.doctype, controller.name))
 	write_sle(controller, sle, scope, ipb, value)
+
+
+def _cascade_backdated_ipb(scope, period, qty, value, source):
+	"""A backdated posting lands in ITS period's balance row; every later
+	period's opening (and thus closing) must shift by the same delta or the
+	materialized chain goes stale (workbook period grid restates Beg)."""
+	from sap_valuation.sap_moving_average.kernel import recompute_closing
+
+	later = frappe.get_all(
+		"Inventory Period Balance",
+		filters={"company": scope.company, "item_code": scope.item_code,
+			"warehouse": scope.warehouse or ""},
+		fields=["name", "period_year", "period_month"],
+	)
+	later = sorted(
+		(x for x in later
+			if (x.period_year, x.period_month) > (period.period_year, period.period_month)),
+		key=lambda x: (x.period_year, x.period_month),
+	)
+	for row in later:
+		ipb = frappe.get_doc("Inventory Period Balance", row.name)
+		ipb.opening_qty = flt(ipb.opening_qty) + qty
+		ipb.opening_value = r2(flt(ipb.opening_value) + value)
+		recompute_closing(ipb)
+		if flt(ipb.period_standard_cost):
+			ipb.closing_reference_value = r2(flt(ipb.closing_qty) * flt(ipb.period_standard_cost))
+		scope.save(ipb, source=source)
 
 
 # ------------------------------------------------------------ value events

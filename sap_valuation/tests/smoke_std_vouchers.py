@@ -480,7 +480,11 @@ def run_year_end(company, wh):
 		srv and str(srv[0].posting_date) == "2026-01-01" and flt(srv[0].total_sc, 2) == -300,
 		str(srv))
 
-	sett2 = e2.close_period(year=today.year, month=today.month, sc=12,
-		source=("Stock Reconciliation", sr.name))
-	check("new-year settlement passes gate, carry re-settles (var 300)",
+	# MTD carry is adjacent-month (workbook v2.05): the Dec carry sits in
+	# January's pool and rolls forward through SEQUENTIAL monthly settlements
+	sett2 = None
+	for m in range(1, today.month + 1):
+		sett2 = e2.close_period(year=today.year, month=m, sc=12,
+			source=("Stock Reconciliation", sr.name))
+	check("new-year sequential settles roll the carry (last var 300)",
 		flt(sett2.variance, 2) == 300, f"{sett2.variance}")
