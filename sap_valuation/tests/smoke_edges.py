@@ -8,7 +8,7 @@ and SI update_stock issues. Rolled back unless commit=True.
 """
 
 import frappe
-from frappe.utils import add_months, flt, get_first_day, nowdate
+from frappe.utils import add_days, add_months, flt, get_first_day, nowdate
 
 from sap_valuation.tests.smoke_kernel import COMPANY, ensure_masters
 
@@ -399,6 +399,26 @@ def run(commit=False):
 		check("batch item blocked from SAP method", False, "insert succeeded")
 	except frappe.ValidationError:
 		check("batch item blocked from SAP method", True)
+
+	# ============ Stock Ageing works for routed items (OI-8 / DR-27):
+	# the report replays SLE-compatible rows FIFO by date — valuation-agnostic
+	age_it = make_item("_SMK-AGE")
+	make_pr(age_it, wh, 100, 10, posting_date=add_days(nowdate(), -20))
+	make_pr(age_it, wh, 50, 12)
+	make_dn(age_it, wh, 40)
+	from erpnext.stock.report.stock_ageing.stock_ageing import execute as _age_exec
+
+	res = _age_exec(frappe._dict({"company": COMPANY, "to_date": nowdate(),
+		"range": "10, 30, 60", "item_code": age_it, "warehouse": wh}))
+	cols, rows = res[0], [r for r in res[1] if r[0] == age_it]
+	if rows:
+		row = dict(zip([c.get("fieldname") for c in cols], rows[0]))
+		check("Stock Ageing: FIFO ages exact for routed item",
+			flt(row.get("qty")) == 110 and int(row.get("earliest") or row.get("earliest_age") or 0) == 20
+			and flt(row.get("average_age"), 2) == flt(1200 / 110, 2),
+			str(row))
+	else:
+		check("Stock Ageing: FIFO ages exact for routed item", False, "item missing from report")
 
 	failed = [x for x in CHECKS if not x[1]]
 	print(f"\n{len(CHECKS) - len(failed)}/{len(CHECKS)} checks passed")
