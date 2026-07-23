@@ -47,7 +47,7 @@ class Clock:
 class Co:
 	"""Per-scenario isolated company + masters + voucher makers."""
 
-	def __init__(self, name, abbr, item, view="YTD"):
+	def __init__(self, name, abbr, item, view="YTD", method="SAP Standard Cost"):
 		self.name, self.abbr, self.item = name, abbr, item
 		if not frappe.db.exists("Company", name):
 			base = frappe.get_all("Company", filters={"company_name": ("not like", "%Replay%")},
@@ -103,8 +103,9 @@ class Co:
 			frappe.get_doc({"doctype": "Item", "item_code": item, "item_name": item,
 				"item_group": frappe.get_all("Item Group", filters={"is_group": 0}, limit=1, pluck="name")[0],
 				"stock_uom": frappe.get_all("UOM", limit=1, pluck="name")[0],
-				"is_stock_item": 1, "valuation_method": "SAP Standard Cost",
-				"settlement_view": view}).insert(ignore_permissions=True)
+				"is_stock_item": 1, "valuation_method": method,
+				**({"settlement_view": view} if method == "SAP Standard Cost" else {}),
+			}).insert(ignore_permissions=True)
 
 	def period(self, year, month, status="OPEN"):
 		name = frappe.db.get_value("Inventory Period",
