@@ -230,7 +230,8 @@ class StdEngine:
 		if trans in ("Rev Beg", "REV In", "REV out") and t_sc_override is not None \
 				and sc is not None and ac is not None:
 			expected_qty = self._reval_qty_at(trans, ent, sc_new=flt(sc), sc_old=flt(ac))
-			expected = abs(flt(sc) - flt(ac)) * expected_qty
+			# the out bucket can be net NEGATIVE (SC+ dominated) — compare magnitudes
+			expected = abs(abs(flt(sc) - flt(ac)) * expected_qty)
 			if abs(abs(total_sc) - expected) > 0.01:
 				raise RevalTSCDriftError(
 					_("{0} amount {1} does not match |SC delta| x categorized qty = {2}.").format(
@@ -637,19 +638,16 @@ class StdEngine:
 					self.item_code, year, month
 				)
 			)
-		if end_qty <= 0:
-			# all variance belongs to consumption
-			es_var, out_var = 0.0, r2(var)
-			share, cons_share = 0.0, 1.0
-		elif end_qty >= denom:
-			# nothing consumed: all variance capitalizes
-			es_var, out_var = r2(var), 0.0
-			share, cons_share = 1.0, 0.0
-		else:
-			es_var = r2(var * end_qty / denom)
-			out_var = r2(var * out_qty / denom)
-			share = end_qty / denom
-			cons_share = out_qty / denom
+		# RAW proportional split always (year-transfer workbook, DR-30): when
+		# ending qty exceeds the base the inventory share exceeds the pool and
+		# the consumption share goes NEGATIVE — they still sum to the pool
+		# because end + out = base. The old all-to-consumption/all-to-inventory
+		# clamps only ever fired in exactly these cases and contradicted the
+		# workbook (Jan: es 6559.5611 / out -218.652 on a 6340.91 pool).
+		es_var = r2(var * end_qty / denom)
+		out_var = r2(var * out_qty / denom)
+		share = end_qty / denom
+		cons_share = out_qty / denom
 
 		frappe.flags[KERNEL_FLAG] = True
 		try:
@@ -711,6 +709,10 @@ class StdEngine:
 			ipb = scope.load(period)
 			ipb.reval_value = flt(ipb.reval_value) + r2(amount)
 			recompute_closing(ipb)
+			if not flt(ipb.period_standard_cost):
+				ipb.period_standard_cost = flt(sett.standard_cost)
+				ipb.moving_avg_price = flt(sett.standard_cost)
+				ipb.resolved_settlement_view = self.view
 			_cascade_backdated_ipb(scope, period, 0, r2(amount), source=("Inventory Period Settlement", sett.name))
 			if flt(ipb.period_standard_cost):
 				ipb.moving_avg_price = flt(ipb.period_standard_cost)
